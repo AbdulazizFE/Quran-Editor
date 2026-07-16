@@ -103,6 +103,7 @@ let recordedChunks = [];
 let recordVideoTrack = null; // CanvasCaptureMediaStreamTrack (manuell frame-push)
 let recordTimer = null; // jämn render-/fångst-timer under inspelning
 let frameTick = 0; // räknare för "anti-freeze"-pixeln under inspelning
+let exporting = false; // pågår en deterministisk export just nu?
 let exportReady = null; // { url, filename, file, canShare } efter en export
 
 function getAudioCtx() {
@@ -469,13 +470,7 @@ function renderLoop() {
 }
 
 function renderFrame() {
-  const cw = canvas.width,
-    ch = canvas.height;
-
-  // Håll bakgrundsvideon igång och looprad under uppspelning/inspelning.
-  // På iOS är 'loop'-attributet och 'ended'-eventet opålitliga när videon ritas
-  // till en canvas som spelas in, och när videon tar slut fryser hela fångsten
-  // (videons bildrutor driver canvas-inspelningen). Därför loopar vi proaktivt.
+  // Håll bakgrundsvideon igång och looprad under uppspelning/inspelning (live).
   if (state.bg.type === "video" && state.bg.el) {
     const v = state.bg.el;
     const active = state.recording || (previewSource && !state.paused);
@@ -488,13 +483,10 @@ function renderFrame() {
         dur > 0 &&
         (v.ended || v.currentTime >= dur - 0.15)
       ) {
-        // Spola tillbaka strax före slutet så videon aldrig stannar på en
-        // frusen sista bild (vilket annars fryser hela inspelningen på iOS).
         try {
           v.currentTime = 0;
         } catch (e) {}
       }
-      // Se till att videon alltid spelar under inspelning/uppspelning.
       if (v.paused && v.readyState >= 1) {
         const p = v.play();
         if (p && p.catch) p.catch(() => {});
@@ -502,13 +494,31 @@ function renderFrame() {
     }
   }
 
-  // Tidsberäkning för animeringar
   const playing = state.playStartTime !== null && state.segments.length > 0;
-  let elapsed = 0;
-  if (playing) elapsed = audioCtx.currentTime - state.playStartTime;
+  const elapsed = playing ? audioCtx.currentTime - state.playStartTime : null;
+  drawCompositeAt(elapsed);
 
-  // Rörelse-progress (0..1). Under uppspelning följer den hela klippets längd,
-  // annars loopar den långsamt så förhandsvisningen ändå rör sig.
+  if (playing && state.recording && state.audioDuration > 0) {
+    setProgress((elapsed / state.audioDuration) * 100);
+  }
+
+  // Anti-freeze: rita en nästan osynlig 2×2-pixel som ändras varje ruta så mobil
+  // auto-sampling (iOS) aldrig tror att bilden är oförändrad under inspelning.
+  if (state.recording) {
+    frameTick = (frameTick + 1) % 256;
+    ctx.fillStyle = `rgb(${frameTick},${(frameTick * 7) % 256},${(frameTick * 13) % 256})`;
+    ctx.fillRect(0, 0, 2, 2);
+  }
+}
+
+// Ritar en komplett bildruta för en given tid i sekunder (elapsed=null → stillbild).
+// Bakgrundsvideon ritas i sitt aktuella läge (live: spelas; export: sökt av anroparen).
+function drawCompositeAt(elapsed) {
+  const cw = canvas.width,
+    ch = canvas.height;
+  const playing = elapsed !== null && state.segments.length > 0;
+
+  // Rörelse-progress (0..1)
   let motionT;
   if (playing && state.audioDuration > 0) {
     motionT = Math.max(0, Math.min(1, elapsed / state.audioDuration));
@@ -516,7 +526,7 @@ function renderFrame() {
     motionT = ((performance.now() / 1000) % 24) / 24;
   }
 
-  if (state.bg.type === "video" && state.bg.el.readyState >= 2) {
+  if (state.bg.type === "video" && state.bg.el && state.bg.el.readyState >= 2) {
     drawCover(state.bg.el, state.bg.el.videoWidth, state.bg.el.videoHeight, motionT);
   } else if (state.bg.type === "image") {
     drawCover(state.bg.el, state.bg.el.naturalWidth, state.bg.el.naturalHeight, motionT);
@@ -531,7 +541,7 @@ function renderFrame() {
   ctx.fillStyle = `rgba(0,0,0,${state.tint})`;
   ctx.fillRect(0, 0, cw, ch);
 
-  // Uppdatera aktuellt segment utifrån uppspelningstiden
+  // Aktuellt segment utifrån tiden
   let segElapsed = null;
   if (playing) {
     let idx = 0;
@@ -540,24 +550,10 @@ function renderFrame() {
     }
     state.currentIndex = idx;
     segElapsed = elapsed - state.startTimes[idx];
-
-    // Visa inspelningsförlopp i procent
-    if (state.recording && state.audioDuration > 0) {
-      setProgress((elapsed / state.audioDuration) * 100);
-    }
   }
 
   if (state.segments.length) drawVerse(computeTextAnim(segElapsed));
   drawWatermark();
-
-  // Anti-freeze: rita en nästan osynlig 2×2-pixel som ändras varje ruta. Det
-  // håller canvasen "smutsig" så mobil auto-sampling (iOS) aldrig tror att
-  // bilden är oförändrad och slutar fånga rutor när bakgrundsvideon tar slut.
-  if (state.recording) {
-    frameTick = (frameTick + 1) % 256;
-    ctx.fillStyle = `rgb(${frameTick},${(frameTick * 7) % 256},${(frameTick * 13) % 256})`;
-    ctx.fillRect(0, 0, 2, 2);
-  }
 }
 
 // Beräkna text-animeringens tillstånd (opacitet, förskjutning, skala, oskärpa)
@@ -772,7 +768,18 @@ function pickMimeType() {
   return "";
 }
 
+// Väljer exportmetod: deterministisk bild-för-bild när bakgrunden är en video
+// (garanterar loop utan frysning), annars vanlig realtidsinspelning.
 function startRecording() {
+  if (!state.combinedBuffer) return;
+  if (state.bg.type === "video" && state.bg.el) {
+    exportWithBackgroundVideo();
+  } else {
+    startRealtimeRecording();
+  }
+}
+
+function startRealtimeRecording() {
   if (!state.combinedBuffer) return;
   stopPreview();
 
@@ -1049,6 +1056,7 @@ function resetExportButton() {
 
 // ---- ffmpeg.wasm (omkodar inspelningen till en TikTok-vänlig MP4) ----
 let ffmpeg = null;
+let ffmpegProgress = (p) => setProgress(p * 100); // hur ffmpeg-progress mappas
 
 // Hämtar en fil och cachar den i webbläsarens Cache Storage så ffmpeg-komponenterna
 // (≈30 MB) bara laddas ner en gång och återanvänds i kommande sessioner. Returnerar
@@ -1075,29 +1083,10 @@ async function cachedBlobURL(url, mimeType) {
 }
 
 async function convertToMp4(inputBlob, inputName = "in.webm", { remux = false } = {}) {
-  if (!ffmpeg) {
-    const { FFmpeg } = await import(
-      "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js"
-    );
-    const b = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
-    ffmpeg = new FFmpeg();
-    // Uppdatera procentmätaren medan omkodningen pågår
-    ffmpeg.on("progress", ({ progress }) => {
-      if (typeof progress === "number") setProgress(progress * 100);
-    });
-    // Ladda även worker-skriptet som blob-URL. Annars misslyckas `new Worker()`
-    // när skriptet ligger på ett annat origin (unpkg) än sidan.
-    await ffmpeg.load({
-      classWorkerURL: await cachedBlobURL(
-        "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/worker.js",
-        "text/javascript"
-      ),
-      coreURL: await cachedBlobURL(`${b}/ffmpeg-core.js`, "text/javascript"),
-      wasmURL: await cachedBlobURL(`${b}/ffmpeg-core.wasm`, "application/wasm"),
-    });
-  }
+  ffmpegProgress = (p) => setProgress(p * 100);
+  const ff = await ensureFfmpeg();
   const input = new Uint8Array(await inputBlob.arrayBuffer());
-  await ffmpeg.writeFile(inputName, input);
+  await ff.writeFile(inputName, input);
 
   // Remux: kopiera strömmarna utan omkodning (snabbt, minnessnålt). Fixar
   // fragmenterad MP4 från iOS -> normal MP4 med moov-atomen först (faststart).
@@ -1127,9 +1116,405 @@ async function convertToMp4(inputBlob, inputName = "in.webm", { remux = false } 
         "-movflags", "+faststart",
         "out.mp4",
       ];
-  await ffmpeg.exec(args);
-  const data = await ffmpeg.readFile("out.mp4");
+  await ff.exec(args);
+  const data = await ff.readFile("out.mp4");
   return new Blob([data.buffer], { type: "video/mp4" });
+}
+
+// Laddar (och cachar) ffmpeg-instansen en gång.
+async function ensureFfmpeg() {
+  if (ffmpeg) return ffmpeg;
+  const { FFmpeg } = await import(
+    "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js"
+  );
+  const b = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
+  const ff = new FFmpeg();
+  ff.on("progress", ({ progress }) => {
+    if (typeof progress === "number") ffmpegProgress(progress);
+  });
+  // Ladda även worker-skriptet som blob-URL. Annars misslyckas `new Worker()`
+  // när skriptet ligger på ett annat origin (unpkg) än sidan.
+  await ff.load({
+    classWorkerURL: await cachedBlobURL(
+      "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/worker.js",
+      "text/javascript"
+    ),
+    coreURL: await cachedBlobURL(`${b}/ffmpeg-core.js`, "text/javascript"),
+    wasmURL: await cachedBlobURL(`${b}/ffmpeg-core.wasm`, "application/wasm"),
+  });
+  ffmpeg = ff;
+  return ffmpeg;
+}
+
+// ---- Deterministisk export (bild-för-bild) ----
+// Används när bakgrunden är en video: varje ruta renderas för en exakt tid och
+// videon söks till (tid % videolängd) → perfekt loop som aldrig fryser. Detta
+// är oberoende av realtidsinspelning (som är opålitlig med video på iOS).
+
+// Sök en video till en given tid och vänta tills bilden är klar.
+function seekVideo(v, time) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      v.removeEventListener("seeked", finish);
+      resolve();
+    };
+    v.addEventListener("seeked", finish);
+    try {
+      v.currentTime = time;
+    } catch (e) {
+      finish();
+    }
+    // Säkerhetsutlösning om 'seeked' inte kommer
+    setTimeout(finish, 400);
+  });
+}
+
+// Fånga aktuell canvas som JPEG-bytes.
+function canvasToJpeg(quality) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) return reject(new Error("toBlob misslyckades"));
+        blob.arrayBuffer().then((ab) => resolve(new Uint8Array(ab)), reject);
+      },
+      "image/jpeg",
+      quality
+    );
+  });
+}
+
+// Konvertera en AudioBuffer till en 16-bitars PCM WAV (Uint8Array).
+function audioBufferToWav(buffer) {
+  const numCh = buffer.numberOfChannels;
+  const sampleRate = buffer.sampleRate;
+  const numFrames = buffer.length;
+  const blockAlign = numCh * 2;
+  const dataSize = numFrames * blockAlign;
+  const ab = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(ab);
+  let p = 0;
+  const wStr = (s) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(p++, s.charCodeAt(i));
+  };
+  const wU32 = (v) => {
+    view.setUint32(p, v, true);
+    p += 4;
+  };
+  const wU16 = (v) => {
+    view.setUint16(p, v, true);
+    p += 2;
+  };
+  wStr("RIFF");
+  wU32(36 + dataSize);
+  wStr("WAVE");
+  wStr("fmt ");
+  wU32(16);
+  wU16(1);
+  wU16(numCh);
+  wU32(sampleRate);
+  wU32(sampleRate * blockAlign);
+  wU16(blockAlign);
+  wU16(16);
+  wStr("data");
+  wU32(dataSize);
+  const chans = [];
+  for (let c = 0; c < numCh; c++) chans.push(buffer.getChannelData(c));
+  for (let i = 0; i < numFrames; i++) {
+    for (let c = 0; c < numCh; c++) {
+      let s = Math.max(-1, Math.min(1, chans[c][i]));
+      view.setInt16(p, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      p += 2;
+    }
+  }
+  return new Uint8Array(ab);
+}
+
+// Rendera alla rutor deterministiskt och koda ihop dem med ljudet till en MP4.
+// Föredrar WebCodecs (inbyggt, snabbt, lågt minne – finns i iOS 17+ och Chrome).
+// Faller tillbaka till ffmpeg.wasm om WebCodecs saknas.
+async function renderAndEncode(fps) {
+  if (await webCodecsSupported()) {
+    try {
+      return await renderAndEncodeWebCodecs(fps);
+    } catch (e) {
+      // Om WebCodecs fallerar mitt i, försök med ffmpeg istället
+      setStatus("جارٍ المحاولة بمحرّك بديل… ⏳", "");
+    }
+  }
+  return await renderAndEncodeFfmpeg(fps);
+}
+
+// Väljer en H.264-profil som enheten faktiskt stödjer för given storlek.
+async function pickAvcCodec(width, height, fps) {
+  const candidates = [
+    "avc1.640028",
+    "avc1.4d0028",
+    "avc1.42e028",
+    "avc1.640020",
+    "avc1.42001f",
+  ];
+  for (const codec of candidates) {
+    try {
+      const res = await VideoEncoder.isConfigSupported({
+        codec,
+        width,
+        height,
+        bitrate: 6_000_000,
+        framerate: fps,
+      });
+      if (res && res.supported) return codec;
+    } catch (e) {}
+  }
+  return null;
+}
+
+async function webCodecsSupported() {
+  if (typeof VideoEncoder === "undefined" || typeof AudioEncoder === "undefined")
+    return false;
+  const codec = await pickAvcCodec(canvas.width, canvas.height, 30);
+  return !!codec;
+}
+
+async function renderAndEncodeWebCodecs(fps) {
+  const width = canvas.width;
+  const height = canvas.height;
+  const buffer = state.combinedBuffer;
+  const sampleRate = buffer.sampleRate;
+  const numCh = buffer.numberOfChannels;
+
+  const codec = await pickAvcCodec(width, height, fps);
+  if (!codec) throw new Error("ingen H.264-profil stöds");
+
+  const { Muxer, ArrayBufferTarget } = await import(
+    "https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/+esm"
+  );
+
+  const muxer = new Muxer({
+    target: new ArrayBufferTarget(),
+    video: { codec: "avc", width, height },
+    audio: { codec: "aac", sampleRate, numberOfChannels: numCh },
+    fastStart: "in-memory",
+  });
+
+  let encodeError = null;
+  const videoEncoder = new VideoEncoder({
+    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+    error: (e) => (encodeError = e),
+  });
+  videoEncoder.configure({
+    codec,
+    width,
+    height,
+    bitrate: isMobile() ? 5_000_000 : 8_000_000,
+    framerate: fps,
+  });
+
+  const bgVideo = state.bg.type === "video" ? state.bg.el : null;
+  if (bgVideo) {
+    try {
+      bgVideo.pause();
+    } catch (e) {}
+  }
+
+  const dur = state.audioDuration;
+  const totalFrames = Math.max(1, Math.round(dur * fps));
+  const frameDur = Math.round(1e6 / fps);
+
+  // 1) Video: rendera + koda varje ruta (0..70 %)
+  for (let i = 0; i < totalFrames; i++) {
+    if (encodeError) throw encodeError;
+    const t = i / fps;
+    if (bgVideo && bgVideo.duration && isFinite(bgVideo.duration)) {
+      const vt = state.loopBg
+        ? t % bgVideo.duration
+        : Math.min(t, bgVideo.duration - 0.05);
+      await seekVideo(bgVideo, vt);
+    }
+    drawCompositeAt(t);
+    const frame = new VideoFrame(canvas, {
+      timestamp: Math.round(t * 1e6),
+      duration: frameDur,
+    });
+    videoEncoder.encode(frame, { keyFrame: i % (fps * 2) === 0 });
+    frame.close();
+    // Backpressure – låt kodaren hinna med
+    if (videoEncoder.encodeQueueSize > 8) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    setProgress((i / totalFrames) * 70);
+    setStatus(`جارٍ رسم الإطارات… ${Math.round((i / totalFrames) * 100)}%`, "");
+  }
+  await videoEncoder.flush();
+  videoEncoder.close();
+
+  // 2) Ljud → AAC (70..92 %)
+  setProgress(72);
+  setStatus("جارٍ ترميز الصوت… ⏳", "");
+  const audioEncoder = new AudioEncoder({
+    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+    error: (e) => (encodeError = e),
+  });
+  audioEncoder.configure({
+    codec: "mp4a.40.2",
+    sampleRate,
+    numberOfChannels: numCh,
+    bitrate: 192000,
+  });
+  const chunkFrames = sampleRate; // 1 sekund per bit
+  for (let start = 0; start < buffer.length; start += chunkFrames) {
+    if (encodeError) throw encodeError;
+    const len = Math.min(chunkFrames, buffer.length - start);
+    // f32-planar: alla sampel för kanal 0, sedan kanal 1, ...
+    const data = new Float32Array(len * numCh);
+    for (let c = 0; c < numCh; c++) {
+      data.set(buffer.getChannelData(c).subarray(start, start + len), c * len);
+    }
+    const audioData = new AudioData({
+      format: "f32-planar",
+      sampleRate,
+      numberOfFrames: len,
+      numberOfChannels: numCh,
+      timestamp: Math.round((start / sampleRate) * 1e6),
+      data,
+    });
+    audioEncoder.encode(audioData);
+    audioData.close();
+    setProgress(72 + (start / buffer.length) * 20);
+  }
+  await audioEncoder.flush();
+  audioEncoder.close();
+  if (encodeError) throw encodeError;
+
+  // 3) Muxa till MP4
+  setProgress(96);
+  muxer.finalize();
+  return new Blob([muxer.target.buffer], { type: "video/mp4" });
+}
+
+// Reserv: rendera rutor och koda med ffmpeg.wasm (JPEG-sekvens + WAV → MP4).
+async function renderAndEncodeFfmpeg(fps) {
+  const dur = state.audioDuration;
+  const totalFrames = Math.max(1, Math.round(dur * fps));
+  const bgVideo = state.bg.type === "video" ? state.bg.el : null;
+  if (bgVideo) {
+    try {
+      bgVideo.pause();
+    } catch (e) {}
+  }
+
+  // Ladda ffmpeg med tidsgräns – om det inte går faller vi tillbaka till realtid.
+  const ff = await withTimeout(ensureFfmpeg(), 90000, "تعذّر تحميل مكوّن الفيديو");
+
+  // 1) Rendera + skriv varje ruta som JPEG (0..65 % av mätaren)
+  const pad = (n) => String(n).padStart(5, "0");
+  for (let i = 0; i < totalFrames; i++) {
+    const t = i / fps;
+    if (bgVideo && bgVideo.duration && isFinite(bgVideo.duration)) {
+      const vt = state.loopBg
+        ? t % bgVideo.duration
+        : Math.min(t, bgVideo.duration - 0.05);
+      await seekVideo(bgVideo, vt);
+    }
+    drawCompositeAt(t);
+    const jpg = await canvasToJpeg(0.82);
+    await ff.writeFile(`f${pad(i)}.jpg`, jpg);
+    setProgress((i / totalFrames) * 65);
+    setStatus(
+      `جارٍ رسم الإطارات… ${Math.round((i / totalFrames) * 100)}%`,
+      ""
+    );
+  }
+
+  // 2) Ljud → WAV
+  const wav = audioBufferToWav(state.combinedBuffer);
+  await ff.writeFile("audio.wav", wav);
+  setProgress(68);
+  setStatus("جارٍ ترميز الفيديو… ⏳", "");
+
+  // 3) Koda video (JPEG-sekvens) + ljud → MP4 (68..100 %)
+  ffmpegProgress = (pr) => setProgress(68 + pr * 32);
+  await ff.exec([
+    "-framerate", String(fps),
+    "-i", "f%05d.jpg",
+    "-i", "audio.wav",
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-pix_fmt", "yuv420p",
+    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+    "-r", String(fps),
+    "-c:a", "aac",
+    "-b:a", "192k",
+    "-ar", "44100",
+    "-ac", "2",
+    "-shortest",
+    "-movflags", "+faststart",
+    "out.mp4",
+  ]);
+  const data = await ff.readFile("out.mp4");
+
+  // 4) Städa MEMFS för att frigöra minne
+  for (let i = 0; i < totalFrames; i++) {
+    try {
+      await ff.deleteFile(`f${pad(i)}.jpg`);
+    } catch (e) {}
+  }
+  try {
+    await ff.deleteFile("audio.wav");
+    await ff.deleteFile("out.mp4");
+  } catch (e) {}
+
+  return new Blob([data.buffer], { type: "video/mp4" });
+}
+
+// Export med bakgrundsvideo: deterministisk bild-för-bild-rendering.
+async function exportWithBackgroundVideo() {
+  if (!state.combinedBuffer) return;
+  exporting = true;
+  stopPreview();
+  const base = `quran-${state.rangeRef.replace(/[:]/g, "-")}`;
+  const fps = isMobile() ? 20 : 25;
+
+  recordBtn.classList.remove("success", "accent");
+  recordBtn.classList.add("recording");
+  recordBtn.textContent = "■ جارٍ الإنشاء…";
+  recordBtn.dataset.mode = "";
+  playBtn.disabled = true;
+  downloadLink.hidden = true;
+  showProgress("جارٍ إنشاء الفيديو…");
+  setProgress(0);
+  setStatus(
+    "جارٍ إنشاء الفيديو إطارًا بإطار (خلفية متكررة ثابتة)… قد يستغرق قليلًا ⏳",
+    ""
+  );
+
+  try {
+    const blob = await renderAndEncode(fps);
+    hideProgress();
+    recordBtn.classList.remove("recording");
+    playBtn.disabled = false;
+    exporting = false;
+    await offerDownload(blob, `${base}.mp4`);
+    setStatus(
+      "تم! الخلفية تتكرر والنص يتبع التلاوة. جاهز للنشر على تيك توك/يوتيوب ✅",
+      "ok"
+    );
+  } catch (err) {
+    // Reserv: fall tillbaka till vanlig realtidsinspelning
+    hideProgress();
+    recordBtn.classList.remove("recording");
+    playBtn.disabled = false;
+    exporting = false;
+    setStatus(
+      "تعذّرت المعالجة الدقيقة (" +
+        err.message +
+        ") – يتم التسجيل بالطريقة العادية…",
+      ""
+    );
+    startRealtimeRecording();
+  }
 }
 
 // ---- Events ----
@@ -1155,6 +1540,7 @@ loopBgChk.addEventListener("change", () => {
 });
 playBtn.addEventListener("click", togglePlayPause);
 recordBtn.addEventListener("click", () => {
+  if (exporting) return; // deterministisk export pågår – ignorera klick
   if (recorder && recorder.state === "recording") {
     stopRecording();
   } else if (recordBtn.dataset.mode === "download") {
