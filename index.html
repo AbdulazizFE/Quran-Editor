@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>استوديو فيديو القرآن</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&family=Tajawal:wght@400;500;700;800&family=Inter:wght@400;500;600;700;800&family=Scheherazade+New:wght@400;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <a class="logo" href="./index.html" aria-label="الصفحة الرئيسية">☾</a>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- لوحة التحكم -->
+    <section class="panel controls">
+      <div class="section">
+        <h2><span class="step">1</span> اختر الآية</h2>
+
+        <label for="surah">السورة</label>
+        <select id="surah"><option>جارٍ التحميل…</option></select>
+
+        <div class="row">
+          <div class="col">
+            <label for="ayahFrom">من آية</label>
+            <select id="ayahFrom"></select>
+          </div>
+          <div class="col">
+            <label for="ayahTo">إلى آية</label>
+            <select id="ayahTo"></select>
+          </div>
+        </div>
+        <p class="hint" id="rangeHint">اختر نفس الآية في الحقلين لعرض آية واحدة.</p>
+
+        <label for="reciter">القارئ</label>
+        <select id="reciter"><option>جارٍ التحميل…</option></select>
+
+        <label for="translation">الترجمة</label>
+        <select id="translation">
+          <option value="">بدون (العربية فقط)</option>
+          <option value="en.sahih" selected>الإنجليزية – Saheeh International</option>
+        </select>
+
+        <button id="loadVerse" class="btn primary">جلب الآية</button>
+      </div>
+
+      <div class="section">
+        <h2><span class="step">2</span> الخلفية</h2>
+        <label for="bgFile" class="filelabel">
+          <span class="filelabel-icon">📁</span>
+          <span>ارفع صورة أو فيديو</span>
+        </label>
+        <input id="bgFile" type="file" accept="image/*,video/*" hidden />
+        <button id="clearBg" class="btn ghost small">إزالة الخلفية</button>
+
+        <label for="aspect">الأبعاد</label>
+        <select id="aspect">
+          <option value="9:16" selected>عمودي 9:16 (جوال / ريلز)</option>
+          <option value="1:1">مربع 1:1</option>
+          <option value="16:9">أفقي 16:9 (حاسوب / يوتيوب)</option>
+        </select>
+
+        <label for="tint">تعتيم الخلفية (لوضوح النص)</label>
+        <input id="tint" type="range" min="0" max="80" value="40" />
+      </div>
+
+      <div class="section">
+        <h2><span class="step">3</span> العلامة المائية</h2>
+        <label for="watermark">نصّك / علامتك</label>
+        <input id="watermark" type="text" class="text-input" value="@Quran - قران" placeholder="مثال: @اسمك" />
+
+        <label for="watermarkPos">الموضع</label>
+        <select id="watermarkPos">
+          <option value="bottom-right" selected>أسفل اليمين</option>
+          <option value="bottom-left">أسفل اليسار</option>
+          <option value="bottom-center">أسفل المنتصف</option>
+          <option value="top-right">أعلى اليمين</option>
+          <option value="top-left">أعلى اليسار</option>
+          <option value="top-center">أعلى المنتصف</option>
+        </select>
+      </div>
+
+      <div class="section">
+        <h2><span class="step">4</span> الحركة والمؤثرات</h2>
+
+        <label for="textAnim">حركة ظهور النص</label>
+        <select id="textAnim">
+          <option value="fade" selected>تلاشٍ (Fade)</option>
+          <option value="slide-up">صعود من الأسفل</option>
+          <option value="zoom-in">تكبير (Zoom)</option>
+          <option value="blur-in">وضوح تدريجي (Blur)</option>
+          <option value="none">بدون حركة</option>
+        </select>
+
+        <label for="bgMotion">حركة الخلفية (Ken Burns)</label>
+        <select id="bgMotion">
+          <option value="none" selected>ثابتة</option>
+          <option value="zoom-in">تكبير بطيء</option>
+          <option value="zoom-out">تصغير بطيء</option>
+          <option value="pan-lr">تحريك يمين ↔ يسار</option>
+          <option value="pan-ud">تحريك أعلى ↕ أسفل</option>
+        </select>
+
+        <label for="fontScale">حجم الخط</label>
+        <input id="fontScale" type="range" min="70" max="140" value="100" />
+
+        <label class="switch-row" for="loopBg">
+          <input id="loopBg" type="checkbox" checked />
+          <span>تكرار فيديو الخلفية حتى تنتهي الآية</span>
+        </label>
+      </div>
+    </section>
+
+    <!-- المعاينة -->
+    <section class="panel preview">
+      <div class="canvas-wrap">
+        <canvas id="preview" width="1080" height="1920"></canvas>
+      </div>
+
+      <div class="transport">
+        <button id="play" class="btn" disabled>▶ تشغيل</button>
+        <button id="record" class="btn accent" disabled>⬇ تصدير الفيديو</button>
+        <a id="download" class="btn success" hidden download>⬇ تنزيل الفيديو</a>
+      </div>
+
+      <div id="progress" class="progress" hidden>
+        <div class="progress-meta">
+          <span id="progressLabel">جارٍ التسجيل…</span>
+          <span id="progressPct">0%</span>
+        </div>
+        <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+      </div>
+
+      <div id="status" class="status">اختر آية ثم اضغط على <b>جلب الآية</b> للبدء.</div>
+    </section>
+  </main>
+
+  <footer class="foot">
+  </footer>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
