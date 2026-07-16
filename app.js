@@ -1528,7 +1528,14 @@ async function exportRealtimeWebCodecs(fps) {
     height,
     bitrate: isMobile() ? 5_000_000 : 8_000_000,
     framerate: fps,
+    // realtime = inga B-frames / ingen omordning av bildrutor. Detta är AVGÖRANDE
+    // för att iOS (QuickTime/Foton) ska kunna spela upp filen — High-profil med
+    // B-frames producerar en fil som iOS ofta vägrar spela.
+    latencyMode: "realtime",
+    // Se till att kodaren matar AVCC (längdprefixade NAL) som mp4-muxer förväntar.
+    avc: { format: "avc" },
   });
+  dbg("video codec=" + vcodec + " latencyMode=realtime " + width + "x" + height);
 
   // --- Starta ljud + spela bakgrundsvideon (loop via uppspelning, ingen sökning) ---
   const bgVideo = state.bg.type === "video" ? state.bg.el : null;
@@ -1685,8 +1692,36 @@ async function exportRealtimeWebCodecs(fps) {
 
   setProgress(98);
   muxer.finalize();
-  dbg("mux done");
-  return new Blob([muxer.target.buffer], { type: "video/mp4" });
+  const outBlob = new Blob([muxer.target.buffer], { type: "video/mp4" });
+  dbg("mux done, size=" + outBlob.size);
+  // Kontrollera den färdiga filens struktur (avslöjar om iOS får en giltig fil)
+  try {
+    const mod = await import("https://cdn.jsdelivr.net/npm/mp4box@0.5.2/+esm");
+    const MP4Box = mod.default || mod.MP4Box || mod;
+    const vf = MP4Box.createFile();
+    await new Promise((res) => {
+      vf.onError = () => res();
+      vf.onReady = (info) => {
+        (info.tracks || []).forEach((t) =>
+          dbg(
+            "  track " + (t.type || (t.audio ? "audio" : "video")) +
+              " codec=" + t.codec +
+              " n=" + t.nb_samples +
+              " dur=" + Math.round((t.duration / t.timescale) * 1000) + "ms"
+          )
+        );
+        res();
+      };
+      outBlob.arrayBuffer().then((ab) => {
+        ab.fileStart = 0;
+        vf.appendBuffer(ab);
+        vf.flush();
+      });
+    });
+  } catch (e) {
+    dbg("struct check failed: " + e);
+  }
+  return outBlob;
 }
 
 // Export med bakgrundsvideo: snabb realtidsrendering med WebCodecs (ingen frysning,
