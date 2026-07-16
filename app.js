@@ -910,18 +910,6 @@ function isMobile() {
   );
 }
 
-// Kan enheten dela videofiler nativt (iOS/Android → spara till Foton/Filer)?
-function canShareVideoFiles() {
-  try {
-    const probe = new File([new Blob([new Uint8Array(1)])], "probe.mp4", {
-      type: "video/mp4",
-    });
-    return !!(navigator.canShare && navigator.canShare({ files: [probe] }));
-  } catch (_) {
-    return false;
-  }
-}
-
 async function finishRecording(mimeType, isMp4) {
   showProgress("جارٍ تصدير الفيديو…");
   setProgress(null);
@@ -1248,21 +1236,6 @@ function audioBufferToWav(buffer) {
   return new Uint8Array(ab);
 }
 
-// Rendera alla rutor deterministiskt och koda ihop dem med ljudet till en MP4.
-// Föredrar WebCodecs (inbyggt, snabbt, lågt minne – finns i iOS 17+ och Chrome).
-// Faller tillbaka till ffmpeg.wasm om WebCodecs saknas.
-async function renderAndEncode(fps) {
-  if (await webCodecsSupported()) {
-    try {
-      return await renderAndEncodeWebCodecs(fps);
-    } catch (e) {
-      // Om WebCodecs fallerar mitt i, försök med ffmpeg istället
-      setStatus("جارٍ المحاولة بمحرّك بديل… ⏳", "");
-    }
-  }
-  return await renderAndEncodeFfmpeg(fps);
-}
-
 // Väljer en H.264-profil som enheten faktiskt stödjer för given storlek.
 async function pickAvcCodec(width, height, fps) {
   const candidates = [
@@ -1294,55 +1267,14 @@ async function webCodecsSupported() {
   return !!codec;
 }
 
-// Välj en samplingsfrekvens som AAC-kodaren faktiskt stödjer (48000/44100 brukar
-// gå, men 22050/24000 stöds oftast inte → tyst ljudfel).
-async function pickAudioRate(numCh) {
-  for (const sr of [48000, 44100]) {
-    try {
-      const r = await AudioEncoder.isConfigSupported({
-        codec: "mp4a.40.2",
-        sampleRate: sr,
-        numberOfChannels: numCh,
-        bitrate: 192000,
-      });
-      if (r && r.supported) return sr;
-    } catch (e) {}
-  }
-  return null;
-}
-
-// Omsampla en AudioBuffer till målfrekvensen via en OfflineAudioContext.
-async function resampleBuffer(buffer, targetRate) {
-  if (buffer.sampleRate === targetRate) return buffer;
-  const Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-  const frames = Math.max(1, Math.ceil(buffer.duration * targetRate));
-  const offline = new Offline(buffer.numberOfChannels, frames, targetRate);
-  const src = offline.createBufferSource();
-  src.buffer = buffer;
-  src.connect(offline.destination);
-  src.start();
-  return await offline.startRendering();
-}
-
-async function renderAndEncodeWebCodecs(fps, opts = {}) {
-  const videoOnly = !!opts.videoOnly;
+// Rendera bakgrunden deterministiskt bild-för-bild och koda en LJUDLÖS MP4 med
+// WebCodecs (loopar utan frysning på iOS). Ljudet muxas in separat av anroparen.
+async function renderAndEncodeWebCodecs(fps) {
   const width = canvas.width;
   const height = canvas.height;
-  const numCh = state.combinedBuffer.numberOfChannels;
 
   const codec = await pickAvcCodec(width, height, fps);
   if (!codec) throw new Error("ingen H.264-profil stöds");
-
-  // AAC-kodaren stödjer bara vissa samplingsfrekvenser (t.ex. inte 22050/24000).
-  // Välj en frekvens som enheten faktiskt stödjer och omsampla ljudet dit –
-  // annars kan ljudkodningen misslyckas tyst och videon bli helt utan ljud.
-  let sampleRate = 48000;
-  let audioBuffer = null;
-  if (!videoOnly) {
-    sampleRate = await pickAudioRate(numCh);
-    if (!sampleRate) throw new Error("AAC-ljud stöds inte");
-    audioBuffer = await resampleBuffer(state.combinedBuffer, sampleRate);
-  }
 
   const { Muxer, ArrayBufferTarget } = await import(
     "https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/+esm"
@@ -1351,9 +1283,6 @@ async function renderAndEncodeWebCodecs(fps, opts = {}) {
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
     video: { codec: "avc", width, height },
-    ...(videoOnly
-      ? {}
-      : { audio: { codec: "aac", sampleRate, numberOfChannels: numCh } }),
     fastStart: "in-memory",
   });
 
@@ -1381,7 +1310,7 @@ async function renderAndEncodeWebCodecs(fps, opts = {}) {
   const totalFrames = Math.max(1, Math.round(dur * fps));
   const frameDur = Math.round(1e6 / fps);
 
-  // 1) Video: rendera + koda varje ruta (0..70 %)
+  // Rendera + koda varje ruta (0..92 %)
   for (let i = 0; i < totalFrames; i++) {
     if (encodeError) throw encodeError;
     const t = i / fps;
@@ -1402,62 +1331,14 @@ async function renderAndEncodeWebCodecs(fps, opts = {}) {
     if (videoEncoder.encodeQueueSize > 8) {
       await new Promise((r) => setTimeout(r, 0));
     }
-    setProgress((i / totalFrames) * 70);
+    setProgress((i / totalFrames) * 92);
     setStatus(`جارٍ رسم الإطارات… ${Math.round((i / totalFrames) * 100)}%`, "");
   }
   await videoEncoder.flush();
   videoEncoder.close();
+  if (encodeError) throw encodeError;
 
-  // 2) Ljud → AAC (70..92 %) – hoppas över när bara videon ska produceras.
-  if (!videoOnly) {
-    setProgress(72);
-    setStatus("جارٍ ترميز الصوت… ⏳", "");
-    let audioChunkCount = 0;
-    const audioEncoder = new AudioEncoder({
-      output: (chunk, meta) => {
-        audioChunkCount++;
-        muxer.addAudioChunk(chunk, meta);
-      },
-      error: (e) => (encodeError = e),
-    });
-    audioEncoder.configure({
-      codec: "mp4a.40.2",
-      sampleRate,
-      numberOfChannels: numCh,
-      bitrate: 192000,
-    });
-    const chunkFrames = sampleRate; // 1 sekund per bit
-    for (let start = 0; start < audioBuffer.length; start += chunkFrames) {
-      if (encodeError) throw encodeError;
-      const len = Math.min(chunkFrames, audioBuffer.length - start);
-      // f32-planar: alla sampel för kanal 0, sedan kanal 1, ...
-      const data = new Float32Array(len * numCh);
-      for (let c = 0; c < numCh; c++) {
-        data.set(
-          audioBuffer.getChannelData(c).subarray(start, start + len),
-          c * len
-        );
-      }
-      const audioData = new AudioData({
-        format: "f32-planar",
-        sampleRate,
-        numberOfFrames: len,
-        numberOfChannels: numCh,
-        timestamp: Math.round((start / sampleRate) * 1e6),
-        data,
-      });
-      audioEncoder.encode(audioData);
-      audioData.close();
-      setProgress(72 + (start / audioBuffer.length) * 20);
-    }
-    await audioEncoder.flush();
-    audioEncoder.close();
-    if (encodeError) throw encodeError;
-    // Om inget ljud kodades: kasta så vi faller tillbaka (ffmpeg fixar ljudet)
-    if (audioChunkCount === 0) throw new Error("ingen ljudkodning");
-  }
-
-  // 3) Muxa till MP4
+  // Muxa till en ljudlös MP4 (ljudet läggs på av anroparen)
   setProgress(96);
   muxer.finalize();
   return new Blob([muxer.target.buffer], { type: "video/mp4" });
@@ -1565,17 +1446,288 @@ async function muxWithAudio(videoBlob) {
   return new Blob([data.buffer], { type: "video/mp4" });
 }
 
-// Bygg en färdig MP4 med loopande bakgrundsvideo + ljud, utan frysning:
-// WebCodecs renderar videon deterministiskt (ingen frysning), ffmpeg lägger på
-// ljudet (pålitlig AAC). Om ffmpeg inte går kastar den vidare → anroparen faller
-// tillbaka till realtidsinspelning (där ljudet garanterat följer med).
-async function buildVideoWithAudio(fps) {
-  if (!(await webCodecsSupported())) {
-    // Utan WebCodecs krävs ffmpeg för hela jobbet ändå.
-    return await renderAndEncodeFfmpeg(fps);
+// Bygg AudioSpecificConfig-bytes för AAC-LC (mp4a.40.2) utifrån frekvens/kanaler.
+// Krävs av mp4-muxer för att skriva en giltig esds-atom kring de färdiga AAC-ramarna.
+function makeAacAsc(sampleRate, channels) {
+  const rates = [
+    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000,
+    11025, 8000, 7350,
+  ];
+  let idx = rates.indexOf(sampleRate);
+  if (idx < 0) idx = 4; // fallback 44100
+  const objType = 2; // AAC LC
+  const ch = Math.max(1, Math.min(7, channels || 2));
+  const b0 = (objType << 3) | (idx >> 1);
+  const b1 = ((idx & 1) << 7) | (ch << 3);
+  return new Uint8Array([b0, b1]);
+}
+
+// Spela recitationen i realtid genom en MediaStreamAudioDestinationNode och spela
+// in den med MediaRecorder. På iOS är detta den ENDA metoden som garanterat ger
+// hörbart ljud (WebCodecs AAC-kodaren kan bli tyst där). Returnerar { blob, mime }.
+function recordAudioTrack(onProgress) {
+  return new Promise((resolve, reject) => {
+    const acx = getAudioCtx();
+    if (acx.state === "suspended") acx.resume();
+    const dest = acx.createMediaStreamDestination();
+    const src = acx.createBufferSource();
+    src.buffer = state.combinedBuffer;
+    src.connect(dest);
+
+    const cands = [
+      "audio/mp4;codecs=mp4a.40.2",
+      "audio/mp4",
+      "audio/webm;codecs=opus",
+      "audio/webm",
+    ];
+    let mime = "";
+    for (const m of cands) {
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) {
+        mime = m;
+        break;
+      }
+    }
+
+    let rec;
+    try {
+      rec = new MediaRecorder(dest.stream, mime ? { mimeType: mime } : undefined);
+    } catch (e) {
+      return reject(e);
+    }
+
+    const chunks = [];
+    const totalDur = state.audioDuration || state.combinedBuffer.duration || 1;
+    const startT = acx.currentTime;
+    const ticker = setInterval(() => {
+      if (onProgress) {
+        onProgress(Math.min(1, (acx.currentTime - startT) / totalDur));
+      }
+    }, 100);
+
+    rec.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+    rec.onerror = (e) => {
+      clearInterval(ticker);
+      reject((e && e.error) || new Error("فشل تسجيل الصوت"));
+    };
+    rec.onstop = () => {
+      clearInterval(ticker);
+      if (onProgress) onProgress(1);
+      resolve({ blob: new Blob(chunks, { type: mime || "audio/mp4" }), mime });
+    };
+    src.onended = () => {
+      try {
+        rec.stop();
+      } catch (e) {}
+    };
+
+    try {
+      rec.start();
+      src.start();
+    } catch (e) {
+      clearInterval(ticker);
+      reject(e);
+    }
+  });
+}
+
+// Extrahera färdigkodade AAC-ramar ur en (ev. fragmenterad) MP4-inspelning med
+// mp4box.js. Ger { codec, sampleRate, channels, description, chunks:[{data,type,
+// timestamp,duration}] } så vi kan muxa in ljudet utan att koda om (och utan ffmpeg).
+async function demuxAudio(blob, mime) {
+  if (!/audio\/mp4|video\/mp4/i.test(mime || "")) {
+    // Endast MP4/AAC stöds här (iOS ger detta). Annat (webm/opus) → reservväg.
+    throw new Error("ljudformatet stöds inte för demux");
   }
-  const videoBlob = await renderAndEncodeWebCodecs(fps, { videoOnly: true });
-  return await muxWithAudio(videoBlob);
+  const mod = await import("https://cdn.jsdelivr.net/npm/mp4box@0.5.2/+esm");
+  const MP4Box = mod.default || mod.MP4Box || mod;
+  const file = MP4Box.createFile();
+  const chunks = [];
+
+  const meta = await new Promise((resolve, reject) => {
+    file.onError = (e) => reject(new Error("mp4box: " + e));
+    file.onReady = (info) => {
+      const at =
+        (info.audioTracks && info.audioTracks[0]) ||
+        (info.tracks || []).find((t) => t.type === "audio" || t.audio);
+      if (!at) {
+        reject(new Error("لا يوجد مسار صوت"));
+        return;
+      }
+      const m = {
+        id: at.id,
+        sampleRate: (at.audio && at.audio.sample_rate) || 44100,
+        channels:
+          (at.audio && at.audio.channel_count) ||
+          state.combinedBuffer.numberOfChannels ||
+          2,
+        codec: /opus/i.test(at.codec) ? "opus" : "aac",
+      };
+      file.setExtractionOptions(at.id, null, { nbSamples: 1000000 });
+      file.start();
+      resolve(m);
+    };
+
+    file.onSamples = (id, user, samps) => {
+      for (const s of samps) {
+        chunks.push({
+          data: s.data,
+          type: s.is_sync ? "key" : "delta",
+          timestamp: Math.round((s.cts / s.timescale) * 1e6),
+          duration: Math.round((s.duration / s.timescale) * 1e6),
+        });
+      }
+    };
+
+    blob
+      .arrayBuffer()
+      .then((ab) => {
+        ab.fileStart = 0;
+        file.appendBuffer(ab);
+        file.flush();
+      })
+      .catch(reject);
+  });
+
+  if (!chunks.length) throw new Error("لم يُستخرج أي صوت");
+  meta.description =
+    meta.codec === "aac" ? makeAacAsc(meta.sampleRate, meta.channels) : undefined;
+  meta.chunks = chunks;
+  return meta;
+}
+
+// Bygg en färdig MP4 med loopande bakgrundsvideo + ljud, utan frysning och utan
+// ffmpeg: WebCodecs renderar videon deterministiskt (ingen frysning på iOS) och
+// ljudet spelas in med MediaRecorder (garanterat hörbart på iOS), demuxas till
+// AAC-ramar med mp4box och muxas ihop med videon via mp4-muxer.
+async function buildVideoWithRecordedAudio(fps) {
+  // 1) Spela in ljudet i realtid (hörbart på iOS).
+  setStatus("جارٍ تسجيل الصوت… ⏳", "");
+  setProgress(0);
+  const { blob: audioBlob, mime } = await recordAudioTrack((p) =>
+    setProgress(p * 30)
+  );
+
+  // 2) Demuxa AAC-ramarna ur inspelningen.
+  setStatus("جارٍ تجهيز الصوت… ⏳", "");
+  const audio = await demuxAudio(audioBlob, mime);
+
+  // 3) Sätt upp muxern med både video- och ljudspår.
+  const width = canvas.width;
+  const height = canvas.height;
+  const codec = await pickAvcCodec(width, height, fps);
+  if (!codec) throw new Error("ingen H.264-profil stöds");
+
+  const { Muxer, ArrayBufferTarget } = await import(
+    "https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/+esm"
+  );
+  const muxer = new Muxer({
+    target: new ArrayBufferTarget(),
+    video: { codec: "avc", width, height },
+    audio: {
+      codec: audio.codec,
+      sampleRate: audio.sampleRate,
+      numberOfChannels: audio.channels,
+    },
+    fastStart: "in-memory",
+  });
+
+  // 4) Rendera videon deterministiskt (loopar, fryser aldrig).
+  let encodeError = null;
+  const videoEncoder = new VideoEncoder({
+    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+    error: (e) => (encodeError = e),
+  });
+  videoEncoder.configure({
+    codec,
+    width,
+    height,
+    bitrate: isMobile() ? 5_000_000 : 8_000_000,
+    framerate: fps,
+  });
+
+  const bgVideo = state.bg.type === "video" ? state.bg.el : null;
+  if (bgVideo) {
+    try {
+      bgVideo.pause();
+    } catch (e) {}
+  }
+
+  const dur = state.audioDuration;
+  const totalFrames = Math.max(1, Math.round(dur * fps));
+  const frameDur = Math.round(1e6 / fps);
+
+  for (let i = 0; i < totalFrames; i++) {
+    if (encodeError) throw encodeError;
+    const t = i / fps;
+    if (bgVideo && bgVideo.duration && isFinite(bgVideo.duration)) {
+      const vt = state.loopBg
+        ? t % bgVideo.duration
+        : Math.min(t, bgVideo.duration - 0.05);
+      await seekVideo(bgVideo, vt);
+    }
+    drawCompositeAt(t);
+    const frame = new VideoFrame(canvas, {
+      timestamp: Math.round(t * 1e6),
+      duration: frameDur,
+    });
+    videoEncoder.encode(frame, { keyFrame: i % (fps * 2) === 0 });
+    frame.close();
+    if (videoEncoder.encodeQueueSize > 8) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    setProgress(30 + (i / totalFrames) * 62);
+    setStatus(`جارٍ رسم الإطارات… ${Math.round((i / totalFrames) * 100)}%`, "");
+  }
+  await videoEncoder.flush();
+  videoEncoder.close();
+  if (encodeError) throw encodeError;
+
+  // 5) Muxa in de färdiga AAC-ramarna (ingen omkodning).
+  setProgress(94);
+  setStatus("جارٍ دمج الصوت… ⏳", "");
+  for (let i = 0; i < audio.chunks.length; i++) {
+    const c = audio.chunks[i];
+    const meta =
+      i === 0
+        ? {
+            decoderConfig: {
+              codec: audio.codec === "aac" ? "mp4a.40.2" : "opus",
+              sampleRate: audio.sampleRate,
+              numberOfChannels: audio.channels,
+              description: audio.description,
+            },
+          }
+        : undefined;
+    muxer.addAudioChunkRaw(c.data, c.type, c.timestamp, c.duration, meta);
+  }
+
+  setProgress(98);
+  muxer.finalize();
+  return new Blob([muxer.target.buffer], { type: "video/mp4" });
+}
+
+// Bygg en färdig MP4 med loopande bakgrundsvideo + ljud, utan frysning.
+// Föredragen väg (mobil-säker, utan ffmpeg): WebCodecs-video + inspelat ljud
+// (MediaRecorder) demuxat med mp4box. Reservvägar: WebCodecs-video + ffmpeg-mux,
+// sedan full ffmpeg. Anroparen faller till slut tillbaka till realtidsinspelning.
+async function buildVideoWithAudio(fps) {
+  if (await webCodecsSupported()) {
+    // 1) Bästa vägen: inget ffmpeg alls.
+    try {
+      return await buildVideoWithRecordedAudio(fps);
+    } catch (e) {
+      // fortsätt till ffmpeg-baserad reserv
+    }
+    // 2) Reserv: WebCodecs-video (ljudlös) + ffmpeg lägger på ljudet.
+    try {
+      const videoBlob = await renderAndEncodeWebCodecs(fps);
+      return await muxWithAudio(videoBlob);
+    } catch (e2) {}
+  }
+  // 3) Sista reserv: hela jobbet via ffmpeg.
+  return await renderAndEncodeFfmpeg(fps);
 }
 
 // Export med bakgrundsvideo: deterministisk bild-för-bild-rendering.
