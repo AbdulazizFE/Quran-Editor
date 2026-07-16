@@ -42,6 +42,8 @@ const ASPECTS = {
   "16:9": { w: 1920, h: 1080 },
 };
 
+const EXPORT_DEBUG = false; // sätt true för extra exportdiagnostik i utveckling
+
 const state = {
   surahs: [],
   segments: [], // [{ arabic, translation, translationDir, ref, duration }]
@@ -121,36 +123,6 @@ const pad3 = (n) => String(n).padStart(3, "0");
 function setStatus(msg, type = "") {
   statusEl.className = "status" + (type ? " " + type : "");
   statusEl.innerHTML = msg;
-}
-
-// ---- Synlig diagnostik (för att felsöka export på mobil) ----
-// Skriver tidsstämplade rader i en liten ruta på skärmen + i konsollen, så vi
-// kan se exakt vilken exportväg som körs och var det ev. fallerar på iPhone.
-let dbgBox = null;
-function dbg(msg) {
-  try {
-    console.log("[export]", msg);
-    if (!dbgBox) {
-      dbgBox = document.createElement("div");
-      dbgBox.id = "exportDebug";
-      dbgBox.style.cssText =
-        "position:fixed;left:6px;right:6px;bottom:6px;max-height:38vh;overflow:auto;z-index:99999;" +
-        "background:rgba(0,0,0,.86);color:#0f0;font:11px/1.35 monospace;padding:8px 10px;border-radius:8px;" +
-        "white-space:pre-wrap;direction:ltr;text-align:left;box-shadow:0 4px 20px rgba(0,0,0,.5);";
-      const close = document.createElement("button");
-      close.textContent = "✕ stäng logg";
-      close.style.cssText =
-        "position:sticky;top:0;float:right;background:#333;color:#fff;border:0;border-radius:6px;padding:2px 8px;font:11px monospace;cursor:pointer;";
-      close.onclick = () => dbgBox.remove();
-      dbgBox.appendChild(close);
-      document.body.appendChild(dbgBox);
-    }
-    const line = document.createElement("div");
-    const t = (performance.now() / 1000).toFixed(2);
-    line.textContent = `${t}s  ${msg}`;
-    dbgBox.appendChild(line);
-    dbgBox.scrollTop = dbgBox.scrollHeight;
-  } catch (_) {}
 }
 
 
@@ -804,6 +776,7 @@ function pickMimeType() {
   const candidates = [
     "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
     "video/mp4;codecs=h264,aac",
+    "video/mp4;codecs=avc1.4d401f,mp4a.40.2",
     "video/mp4",
     "video/webm;codecs=vp9,opus",
     "video/webm;codecs=vp8,opus",
@@ -813,6 +786,14 @@ function pickMimeType() {
     if (window.MediaRecorder && MediaRecorder.isTypeSupported(c)) return c;
   }
   return "";
+}
+
+function getRecorderOptions(mimeType) {
+  const opts = {};
+  if (mimeType) opts.mimeType = mimeType;
+  opts.videoBitsPerSecond = isMobile() ? 5_000_000 : 10_000_000;
+  opts.audioBitsPerSecond = 192_000;
+  return opts;
 }
 
 // Exportmetod: bakgrundsvideo → deterministisk WebCodecs-rendering (loopar utan
@@ -863,7 +844,7 @@ function startRealtimeRecording() {
 
   recordedChunks = [];
   try {
-    recorder = new MediaRecorder(combined, mimeType ? { mimeType } : undefined);
+    recorder = new MediaRecorder(combined, getRecorderOptions(mimeType));
   } catch (err) {
     setStatus("التسجيل غير مدعوم في هذا المتصفح: " + err.message, "err");
     return;
@@ -1626,7 +1607,7 @@ async function exportRealtimeWebCodecs(fps) {
     codec: vcodec,
     width,
     height,
-    bitrate: isMobile() ? 5_000_000 : 8_000_000,
+    bitrate: isMobile() ? 6_000_000 : 10_000_000,
     framerate: fps,
     // realtime = inga B-frames / ingen omordning av bildrutor. Detta är AVGÖRANDE
     // för att iOS (QuickTime/Foton) ska kunna spela upp filen — High-profil med
@@ -1795,35 +1776,37 @@ async function exportRealtimeWebCodecs(fps) {
   const outBlob = new Blob([muxer.target.buffer], { type: "video/mp4" });
   dbg("mux done, size=" + outBlob.size);
   // Kontrollera den färdiga filens struktur (avslöjar om iOS får en giltig fil)
-  try {
-    const mod = await import("https://cdn.jsdelivr.net/npm/mp4box@0.5.2/+esm");
-    const MP4Box = mod.default || mod.MP4Box || mod;
-    const vf = MP4Box.createFile();
-    await new Promise((res) => {
-      vf.onError = () => res();
-      vf.onReady = (info) => {
-        (info.tracks || []).forEach((t) =>
-          dbg(
-            "  track " + (t.type || (t.audio ? "audio" : "video")) +
-              " codec=" + t.codec +
-              " n=" + t.nb_samples +
-              " dur=" + Math.round((t.duration / t.timescale) * 1000) + "ms"
-          )
-        );
-        res();
-      };
-      outBlob.arrayBuffer().then((ab) => {
-        ab.fileStart = 0;
-        vf.appendBuffer(ab);
-        vf.flush();
+  if (EXPORT_DEBUG) {
+    try {
+      const mod = await import("https://cdn.jsdelivr.net/npm/mp4box@0.5.2/+esm");
+      const MP4Box = mod.default || mod.MP4Box || mod;
+      const vf = MP4Box.createFile();
+      await new Promise((res) => {
+        vf.onError = () => res();
+        vf.onReady = (info) => {
+          (info.tracks || []).forEach((t) =>
+            dbg(
+              "  track " + (t.type || (t.audio ? "audio" : "video")) +
+                " codec=" + t.codec +
+                " n=" + t.nb_samples +
+                " dur=" + Math.round((t.duration / t.timescale) * 1000) + "ms"
+            )
+          );
+          res();
+        };
+        outBlob.arrayBuffer().then((ab) => {
+          ab.fileStart = 0;
+          vf.appendBuffer(ab);
+          vf.flush();
+        });
       });
-    });
-  } catch (e) {
-    dbg("struct check failed: " + e);
+    } catch (e) {
+      dbg("struct check failed: " + e);
+    }
+    // Självtest: låt Safaris EGEN spelare försöka läsa filen på just denna enhet.
+    // Detta avgör om problemet är filen (avkodning) eller nedladdningen/delningen.
+    await selfTestPlayable(outBlob);
   }
-  // Självtest: låt Safaris EGEN spelare försöka läsa filen på just denna enhet.
-  // Detta avgör om problemet är filen (avkodning) eller nedladdningen/delningen.
-  await selfTestPlayable(outBlob);
   return outBlob;
 }
 
