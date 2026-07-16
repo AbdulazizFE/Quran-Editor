@@ -123,6 +123,37 @@ function setStatus(msg, type = "") {
   statusEl.innerHTML = msg;
 }
 
+// ---- Synlig diagnostik (för att felsöka export på mobil) ----
+// Skriver tidsstämplade rader i en liten ruta på skärmen + i konsollen, så vi
+// kan se exakt vilken exportväg som körs och var det ev. fallerar på iPhone.
+let dbgBox = null;
+function dbg(msg) {
+  try {
+    console.log("[export]", msg);
+    if (!dbgBox) {
+      dbgBox = document.createElement("div");
+      dbgBox.id = "exportDebug";
+      dbgBox.style.cssText =
+        "position:fixed;left:6px;right:6px;bottom:6px;max-height:38vh;overflow:auto;z-index:99999;" +
+        "background:rgba(0,0,0,.86);color:#0f0;font:11px/1.35 monospace;padding:8px 10px;border-radius:8px;" +
+        "white-space:pre-wrap;direction:ltr;text-align:left;box-shadow:0 4px 20px rgba(0,0,0,.5);";
+      const close = document.createElement("button");
+      close.textContent = "✕ stäng logg";
+      close.style.cssText =
+        "position:sticky;top:0;float:right;background:#333;color:#fff;border:0;border-radius:6px;padding:2px 8px;font:11px monospace;cursor:pointer;";
+      close.onclick = () => dbgBox.remove();
+      dbgBox.appendChild(close);
+      document.body.appendChild(dbgBox);
+    }
+    const line = document.createElement("div");
+    const t = (performance.now() / 1000).toFixed(2);
+    line.textContent = `${t}s  ${msg}`;
+    dbgBox.appendChild(line);
+    dbgBox.scrollTop = dbgBox.scrollHeight;
+  } catch (_) {}
+}
+
+
 // ---- Export-/inspelningsprogress ----
 function showProgress(label) {
   progressLabel.textContent = label || "";
@@ -1369,8 +1400,9 @@ async function demuxAudio(blob, mime) {
   const MP4Box = mod.default || mod.MP4Box || mod;
   const file = MP4Box.createFile();
   const chunks = [];
+  let meta = null;
 
-  const meta = await new Promise((resolve, reject) => {
+  await new Promise((resolve, reject) => {
     file.onError = (e) => reject(new Error("mp4box: " + e));
     file.onReady = (info) => {
       const at =
@@ -1380,7 +1412,7 @@ async function demuxAudio(blob, mime) {
         reject(new Error("لا يوجد مسار صوت"));
         return;
       }
-      const m = {
+      meta = {
         id: at.id,
         sampleRate: (at.audio && at.audio.sample_rate) || 44100,
         channels:
@@ -1391,7 +1423,6 @@ async function demuxAudio(blob, mime) {
       };
       file.setExtractionOptions(at.id, null, { nbSamples: 1000000 });
       file.start();
-      resolve(m);
     };
 
     file.onSamples = (id, user, samps) => {
@@ -1411,10 +1442,14 @@ async function demuxAudio(blob, mime) {
         ab.fileStart = 0;
         file.appendBuffer(ab);
         file.flush();
+        // Ge mp4box en tick att leverera alla sampel (särskilt fragmenterad
+        // iOS-MP4 där sampel kan komma i flera onSamples-anrop) innan vi läser.
+        setTimeout(resolve, 0);
       })
       .catch(reject);
   });
 
+  if (!meta) throw new Error("لا يوجد مسار صوت");
   if (!chunks.length) throw new Error("لم يُستخرج أي صوت");
   meta.description =
     meta.codec === "aac" ? makeAacAsc(meta.sampleRate, meta.channels) : undefined;
@@ -1510,10 +1545,15 @@ async function exportRealtimeWebCodecs(fps) {
     } catch (e) {}
   }
 
+  dbg("realtime: recMime=" + (recMime || "(default)") + " bgVideo=" + !!bgVideo + " bgDur=" + (bgVideo && bgVideo.duration ? bgVideo.duration.toFixed(1) : "?"));
+
   const gopSize = Math.max(1, Math.round(fps * 2));
   let frameIndex = 0;
   let finished = false;
   let timer = null;
+  let bgLoops = 0;
+  let lastBgTime = -1;
+  let bgStalls = 0;
   const startT = acx.currentTime;
 
   audioRec.start();
@@ -1539,6 +1579,7 @@ async function exportRealtimeWebCodecs(fps) {
           if (state.loopBg) {
             try {
               bgVideo.currentTime = 0;
+              bgLoops++;
             } catch (e) {}
           }
         }
@@ -1546,6 +1587,9 @@ async function exportRealtimeWebCodecs(fps) {
           const p = bgVideo.play();
           if (p && p.catch) p.catch(() => {});
         }
+        // Upptäck om bakgrundsvideons bild inte rör sig (stall = fryst bakgrund)
+        if (Math.abs(bgVideo.currentTime - lastBgTime) < 1e-4) bgStalls++;
+        lastBgTime = bgVideo.currentTime;
       }
       drawCompositeAt(elapsed);
       const frame = new VideoFrame(canvas, {
@@ -1578,16 +1622,19 @@ async function exportRealtimeWebCodecs(fps) {
     } catch (e) {}
   }
 
+  dbg("loop done: frames=" + frameIndex + " encodedChunks=" + videoChunks.length + " bgLoops=" + bgLoops + " bgStalls=" + bgStalls);
   await videoEncoder.flush();
   videoEncoder.close();
-  if (encodeError) throw encodeError;
+  if (encodeError) { dbg("videoEncoder error: " + encodeError); throw encodeError; }
   if (!videoChunks.length) throw new Error("ingen videokodning");
 
   // --- Demuxa ljudet och muxa ihop med videon (ingen omkodning, inget ffmpeg) ---
   setProgress(85);
   setStatus("جارٍ دمج الصوت… ⏳", "");
   const audioBlob = await audioBlobReady;
+  dbg("audio recorded: " + audioBlob.size + " bytes type=" + audioBlob.type);
   const audio = await demuxAudio(audioBlob, recMime || audioBlob.type);
+  dbg("audio demuxed: codec=" + audio.codec + " rate=" + audio.sampleRate + " ch=" + audio.channels + " frames=" + audio.chunks.length);
 
   const { Muxer, ArrayBufferTarget } = await import(
     "https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/+esm"
@@ -1635,6 +1682,7 @@ async function exportRealtimeWebCodecs(fps) {
 
   setProgress(98);
   muxer.finalize();
+  dbg("mux done");
   return new Blob([muxer.target.buffer], { type: "video/mp4" });
 }
 
@@ -1662,9 +1710,23 @@ async function exportWithBackgroundVideo() {
   );
 
   try {
-    const blob = (await webCodecsSupported())
-      ? await exportRealtimeWebCodecs(fps)
-      : await renderAndEncodeFfmpeg(fps);
+    dbg("export start; bg=" + state.bg.type + " dur=" + (state.audioDuration || 0).toFixed(1) + "s fps=" + fps);
+    dbg("UA=" + navigator.userAgent);
+    const wc = await webCodecsSupported();
+    dbg(
+      "VideoEncoder=" + (typeof VideoEncoder !== "undefined") +
+        " webCodecsSupported=" + wc +
+        " mp4Rec=" + (window.MediaRecorder && MediaRecorder.isTypeSupported("video/mp4"))
+    );
+    let blob;
+    if (wc) {
+      dbg("-> exportRealtimeWebCodecs");
+      blob = await exportRealtimeWebCodecs(fps);
+    } else {
+      dbg("-> renderAndEncodeFfmpeg (no WebCodecs)");
+      blob = await renderAndEncodeFfmpeg(fps);
+    }
+    dbg("export OK, size=" + blob.size + " bytes");
     hideProgress();
     recordBtn.classList.remove("recording");
     playBtn.disabled = false;
@@ -1676,6 +1738,7 @@ async function exportWithBackgroundVideo() {
     );
   } catch (err) {
     // Reserv: fall tillbaka till vanlig realtidsinspelning (ljud funkar säkert)
+    dbg("EXPORT FAILED: " + (err && (err.message || err)) + " -> realtidsinspelning (kan frysa)");
     hideProgress();
     recordBtn.classList.remove("recording");
     playBtn.disabled = false;
