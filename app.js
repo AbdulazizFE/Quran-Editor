@@ -100,6 +100,8 @@ let audioDest = null; // MediaStreamAudioDestinationNode (för inspelning)
 let previewSource = null; // aktiv uppspelningskälla
 let recorder = null;
 let recordedChunks = [];
+let recordVideoTrack = null; // CanvasCaptureMediaStreamTrack (manuell frame-push)
+let recordTimer = null; // jämn render-/fångst-timer under inspelning
 let exportReady = null; // { url, filename, file, canShare } efter en export
 
 function getAudioCtx() {
@@ -326,6 +328,16 @@ function handleBgFile(file) {
     v.muted = true;
     v.loop = state.loopBg;
     v.playsInline = true;
+    // Manuell loop som reserv: på iOS avfyras inte alltid loop-attributet när
+    // videon ritas till en canvas som spelas in. Spola då tillbaka och spela igen.
+    v.addEventListener("ended", () => {
+      if (state.loopBg) {
+        try {
+          v.currentTime = 0;
+          v.play();
+        } catch (e) {}
+      }
+    });
     // Vänta med att spela – videon startas automatiskt när uppspelning/inspelning
     // börjar och pausas när versen är klar.
     v.pause();
@@ -429,8 +441,28 @@ function wrapText(text, maxWidth) {
 }
 
 function renderLoop() {
+  // Under inspelning sköter en jämn timer renderingen (oberoende av rAF som
+  // mobila webbläsare stryper). Undvik då dubbelrendering här.
+  if (!recordTimer) renderFrame();
+  requestAnimationFrame(renderLoop);
+}
+
+function renderFrame() {
   const cw = canvas.width,
     ch = canvas.height;
+
+  // Håll bakgrundsvideon igång under uppspelning/inspelning. iOS pausar den
+  // ibland när den ritas till en canvas som fångas – återuppta då automatiskt.
+  if (state.bg.type === "video" && state.bg.el) {
+    const v = state.bg.el;
+    if (
+      (state.recording || (previewSource && !state.paused)) &&
+      v.paused &&
+      v.readyState >= 2
+    ) {
+      v.play().catch(() => {});
+    }
+  }
 
   // Tidsberäkning för animeringar
   const playing = state.playStartTime !== null && state.segments.length > 0;
@@ -479,7 +511,6 @@ function renderLoop() {
 
   if (state.segments.length) drawVerse(computeTextAnim(segElapsed));
   drawWatermark();
-  requestAnimationFrame(renderLoop);
 }
 
 // Beräkna text-animeringens tillstånd (opacitet, förskjutning, skala, oskärpa)
@@ -702,7 +733,18 @@ function startRecording() {
   const mimeType = pickMimeType();
   const isMp4 = mimeType.startsWith("video/mp4");
 
-  const videoStream = canvas.captureStream(30);
+  // Använd manuell frame-styrning (captureStream(0) + requestFrame) så bildflödet
+  // blir helt oberoende av requestAnimationFrame, som mobila webbläsare stryper
+  // under inspelning. Faller tillbaka till auto-sampling om det inte stöds.
+  let videoStream = canvas.captureStream(0);
+  let vTrack = videoStream.getVideoTracks()[0];
+  if (!vTrack || typeof vTrack.requestFrame !== "function") {
+    videoStream = canvas.captureStream(30);
+    vTrack = videoStream.getVideoTracks()[0];
+    recordVideoTrack = null;
+  } else {
+    recordVideoTrack = vTrack;
+  }
   const combined = new MediaStream([
     ...videoStream.getVideoTracks(),
     ...audioDest.stream.getAudioTracks(),
@@ -735,6 +777,17 @@ function startRecording() {
   state.recording = true;
   src.onended = () => stopRecording();
 
+  // Rita och fånga rutor med en jämn timer (~30 fps). Varje ruta renderas färskt
+  // från ljudklockan, så texten följer imamen och animeringar/loop spelas in
+  // korrekt även om requestAnimationFrame stryps på mobilen.
+  if (recordTimer) clearInterval(recordTimer);
+  recordTimer = setInterval(() => {
+    renderFrame();
+    if (recordVideoTrack && recordVideoTrack.requestFrame) {
+      recordVideoTrack.requestFrame();
+    }
+  }, 1000 / 30);
+
   recordBtn.classList.remove("success");
   recordBtn.classList.add("recording");
   recordBtn.textContent = "■ إيقاف التصدير";
@@ -747,6 +800,11 @@ function startRecording() {
 }
 
 function stopRecording() {
+  if (recordTimer) {
+    clearInterval(recordTimer);
+    recordTimer = null;
+  }
+  recordVideoTrack = null;
   if (recorder && recorder.state !== "inactive") recorder.stop();
   stopPreview();
   state.recording = false;
