@@ -1721,7 +1721,55 @@ async function exportRealtimeWebCodecs(fps) {
   } catch (e) {
     dbg("struct check failed: " + e);
   }
+  // Självtest: låt Safaris EGEN spelare försöka läsa filen på just denna enhet.
+  // Detta avgör om problemet är filen (avkodning) eller nedladdningen/delningen.
+  await selfTestPlayable(outBlob);
   return outBlob;
+}
+
+// Testa om enhetens egen webbläsare kan spela upp den färdiga filen. Loggar
+// resultatet (kan spela / felkod) i debug-rutan. Felkoder: 3=avkodning, 4=formatet stöds ej.
+function selfTestPlayable(blob) {
+  return new Promise((resolve) => {
+    let done = false;
+    const url = URL.createObjectURL(blob);
+    const v = document.createElement("video");
+    v.muted = true;
+    v.playsInline = true;
+    v.setAttribute("playsinline", "");
+    v.setAttribute("webkit-playsinline", "");
+    v.preload = "auto";
+    const fin = (msg) => {
+      if (done) return;
+      done = true;
+      dbg(msg);
+      try {
+        v.removeAttribute("src");
+        v.load();
+      } catch (e) {}
+      URL.revokeObjectURL(url);
+      resolve();
+    };
+    v.onloadedmetadata = () =>
+      dbg(
+        "selftest: metadata " + v.videoWidth + "x" + v.videoHeight +
+          " dur=" + (v.duration || 0).toFixed(2) + "s"
+      );
+    v.oncanplay = () => fin("selftest: CANPLAY ✓ (Safari kan spela filen)");
+    v.onerror = () =>
+      fin(
+        "selftest: FEL code=" + (v.error && v.error.code) +
+          " " + (v.error && v.error.message)
+      );
+    setTimeout(
+      () => fin("selftest: timeout (readyState=" + v.readyState + ")"),
+      6000
+    );
+    v.src = url;
+    try {
+      v.load();
+    } catch (e) {}
+  });
 }
 
 // Export med bakgrundsvideo: snabb realtidsrendering med WebCodecs (ingen frysning,
