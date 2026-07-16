@@ -1278,15 +1278,50 @@ async function webCodecsSupported() {
   return !!codec;
 }
 
+// Välj en samplingsfrekvens som AAC-kodaren faktiskt stödjer (48000/44100 brukar
+// gå, men 22050/24000 stöds oftast inte → tyst ljudfel).
+async function pickAudioRate(numCh) {
+  for (const sr of [48000, 44100]) {
+    try {
+      const r = await AudioEncoder.isConfigSupported({
+        codec: "mp4a.40.2",
+        sampleRate: sr,
+        numberOfChannels: numCh,
+        bitrate: 192000,
+      });
+      if (r && r.supported) return sr;
+    } catch (e) {}
+  }
+  return null;
+}
+
+// Omsampla en AudioBuffer till målfrekvensen via en OfflineAudioContext.
+async function resampleBuffer(buffer, targetRate) {
+  if (buffer.sampleRate === targetRate) return buffer;
+  const Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const frames = Math.max(1, Math.ceil(buffer.duration * targetRate));
+  const offline = new Offline(buffer.numberOfChannels, frames, targetRate);
+  const src = offline.createBufferSource();
+  src.buffer = buffer;
+  src.connect(offline.destination);
+  src.start();
+  return await offline.startRendering();
+}
+
 async function renderAndEncodeWebCodecs(fps) {
   const width = canvas.width;
   const height = canvas.height;
-  const buffer = state.combinedBuffer;
-  const sampleRate = buffer.sampleRate;
-  const numCh = buffer.numberOfChannels;
+  const numCh = state.combinedBuffer.numberOfChannels;
 
   const codec = await pickAvcCodec(width, height, fps);
   if (!codec) throw new Error("ingen H.264-profil stöds");
+
+  // AAC-kodaren stödjer bara vissa samplingsfrekvenser (t.ex. inte 22050/24000).
+  // Välj en frekvens som enheten faktiskt stödjer och omsampla ljudet dit –
+  // annars kan ljudkodningen misslyckas tyst och videon bli helt utan ljud.
+  const sampleRate = await pickAudioRate(numCh);
+  if (!sampleRate) throw new Error("AAC-ljud stöds inte");
+  const audioBuffer = await resampleBuffer(state.combinedBuffer, sampleRate);
 
   const { Muxer, ArrayBufferTarget } = await import(
     "https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/+esm"
@@ -1353,8 +1388,12 @@ async function renderAndEncodeWebCodecs(fps) {
   // 2) Ljud → AAC (70..92 %)
   setProgress(72);
   setStatus("جارٍ ترميز الصوت… ⏳", "");
+  let audioChunkCount = 0;
   const audioEncoder = new AudioEncoder({
-    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+    output: (chunk, meta) => {
+      audioChunkCount++;
+      muxer.addAudioChunk(chunk, meta);
+    },
     error: (e) => (encodeError = e),
   });
   audioEncoder.configure({
@@ -1364,13 +1403,16 @@ async function renderAndEncodeWebCodecs(fps) {
     bitrate: 192000,
   });
   const chunkFrames = sampleRate; // 1 sekund per bit
-  for (let start = 0; start < buffer.length; start += chunkFrames) {
+  for (let start = 0; start < audioBuffer.length; start += chunkFrames) {
     if (encodeError) throw encodeError;
-    const len = Math.min(chunkFrames, buffer.length - start);
+    const len = Math.min(chunkFrames, audioBuffer.length - start);
     // f32-planar: alla sampel för kanal 0, sedan kanal 1, ...
     const data = new Float32Array(len * numCh);
     for (let c = 0; c < numCh; c++) {
-      data.set(buffer.getChannelData(c).subarray(start, start + len), c * len);
+      data.set(
+        audioBuffer.getChannelData(c).subarray(start, start + len),
+        c * len
+      );
     }
     const audioData = new AudioData({
       format: "f32-planar",
@@ -1382,11 +1424,13 @@ async function renderAndEncodeWebCodecs(fps) {
     });
     audioEncoder.encode(audioData);
     audioData.close();
-    setProgress(72 + (start / buffer.length) * 20);
+    setProgress(72 + (start / audioBuffer.length) * 20);
   }
   await audioEncoder.flush();
   audioEncoder.close();
   if (encodeError) throw encodeError;
+  // Om inget ljud kodades: kasta så vi faller tillbaka till ffmpeg (som fixar ljudet)
+  if (audioChunkCount === 0) throw new Error("ingen ljudkodning");
 
   // 3) Muxa till MP4
   setProgress(96);
