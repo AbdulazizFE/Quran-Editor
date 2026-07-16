@@ -1044,6 +1044,7 @@ async function offerDownload(blob, filename) {
     canShare = false;
   }
   exportReady = { url, filename, file, canShare };
+  dbg("offerDownload: canShare=" + canShare + " size=" + blob.size + " type=" + (blob.type || "?"));
 
   // Förbered den dolda ankarlänken för desktop-nedladdning
   downloadLink.href = url;
@@ -1059,26 +1060,72 @@ async function offerDownload(blob, filename) {
 // Ladda ner eller dela den senast exporterade videon
 async function doDownload() {
   if (!exportReady) return;
+  dbg("spara: canShare=" + exportReady.canShare + " isMobile=" + isMobile());
   if (exportReady.canShare && exportReady.file) {
     try {
       await navigator.share({
         files: [exportReady.file],
         title: exportReady.filename,
       });
+      dbg("share: delningsbladet öppnades ✓");
       return;
     } catch (err) {
-      if (err && err.name === "AbortError") return; // användaren avbröt
-      // annars: fall vidare till vanlig nedladdning
+      if (err && err.name === "AbortError") {
+        dbg("share: avbröts av användaren");
+        return; // användaren avbröt
+      }
+      dbg("share MISSLYCKADES: " + (err && (err.message || err.name)));
+      // annars: fall vidare till inline-video / vanlig nedladdning
     }
   }
   if (isMobile()) {
-    // iOS Safari ignorerar download-attributet → öppna i ny flik för att spara
-    window.open(exportReady.url, "_blank");
+    // iOS blockerar blob-nedladdning och window.open(blob:). Visa i stället
+    // videon inline så användaren kan HÅLLA IN → "Spara video" (funkar alltid).
+    dbg("mobil-reserv: visar inline-video för långtryck → spara");
+    showInlineVideoForSave();
   } else {
     downloadLink.href = exportReady.url;
     downloadLink.download = exportReady.filename;
     downloadLink.click();
   }
+}
+
+// Visa den exporterade videon inline med kontroller + instruktion. På iOS kan
+// användaren hålla in videon och välja "Spara video" – den mest pålitliga metoden.
+function showInlineVideoForSave() {
+  if (!exportReady || !exportReady.url) return;
+  let wrap = document.getElementById("inlineSave");
+  if (wrap) wrap.remove();
+  wrap = document.createElement("div");
+  wrap.id = "inlineSave";
+  wrap.style.cssText =
+    "position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.92);display:flex;" +
+    "flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:16px;";
+  const msg = document.createElement("div");
+  msg.style.cssText =
+    "color:#fff;font:600 15px/1.5 -apple-system,sans-serif;text-align:center;max-width:90%;direction:rtl;";
+  msg.innerHTML =
+    "اضغط مطولاً على الفيديو ثم اختر «حفظ الفيديو» 💾<br>" +
+    "<span style='opacity:.8;font-size:13px'>(håll in videon → Spara video)</span>";
+  const video = document.createElement("video");
+  video.src = exportReady.url;
+  video.controls = true;
+  video.playsInline = true;
+  video.setAttribute("playsinline", "");
+  video.setAttribute("webkit-playsinline", "");
+  video.style.cssText =
+    "max-width:100%;max-height:72vh;border-radius:10px;background:#000;";
+  const close = document.createElement("button");
+  close.textContent = "✕ إغلاق / stäng";
+  close.style.cssText =
+    "background:#2a2a2a;color:#fff;border:0;border-radius:10px;padding:10px 18px;font:600 15px sans-serif;";
+  close.onclick = () => wrap.remove();
+  wrap.appendChild(msg);
+  wrap.appendChild(video);
+  wrap.appendChild(close);
+  document.body.appendChild(wrap);
+  const p = video.play();
+  if (p && p.catch) p.catch(() => {});
 }
 
 // Återställ export-/nedladdningsknappen till "Exportera video"
@@ -1861,6 +1908,13 @@ loopBgChk.addEventListener("change", () => {
   if (state.bg.type === "video" && state.bg.el) state.bg.el.loop = state.loopBg;
 });
 playBtn.addEventListener("click", togglePlayPause);
+// På mobil är blob-nedladdning via <a download> opålitlig → använd dela/inline-spara.
+downloadLink.addEventListener("click", (e) => {
+  if (isMobile() && exportReady) {
+    e.preventDefault();
+    doDownload();
+  }
+});
 recordBtn.addEventListener("click", () => {
   if (exporting) return; // deterministisk export pågår – ignorera klick
   if (recorder && recorder.state === "recording") {
