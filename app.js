@@ -958,9 +958,36 @@ async function exportRecording(mimeType, isMp4) {
 
   // På mobil (särskilt iPhone) är ffmpeg.wasm opålitligt: worker-skript från
   // annat origin kan blockeras och minnet räcker sällan – det gör att exporten
-  // fastnar eller kraschar. iOS Safari spelar redan in en spelbar MP4, så vi
-  // hoppar över omkodningen och erbjuder inspelningen direkt för att spara/dela.
+  // fastnar eller kraschar. Men om inspelningen blir webm på mobilen måste vi
+  // ändå försöka konvertera till MP4, annars fungerar den ofta inte i Safari.
   if (isMobile()) {
+    dbg("mobile export: isMp4=" + isMp4 + " mimeType=" + mimeType + " blob.type=" + blob.type);
+    if (!isMp4) {
+      setStatus(
+        "جارٍ تحويل الفيديو إلى MP4 للهواتف المحمولة… ⏳",
+        ""
+      );
+      try {
+        const mp4Blob = await withTimeout(
+          convertToMp4(blob, inputName, { remux: true }),
+          120000,
+          "انتهت المهلة"
+        );
+        await offerDownload(mp4Blob, `${base}.mp4`);
+        setStatus(
+          "تم! اضغط على الزر لحفظ الفيديو أو مشاركته. ✅",
+          "ok"
+        );
+        return;
+      } catch (err) {
+        dbg("mobile conversion failed: " + (err && err.message));
+        setStatus(
+          "تم إنشاء الفيديو، لكن لم تمكّن عملية التحويل التلقائي. سيتم تنزيل النسخة الأصلية.",
+          ""
+        );
+      }
+    }
+
     const ext = isMp4 ? "mp4" : "webm";
     await offerDownload(blob, `${base}.${ext}`);
     setStatus(
