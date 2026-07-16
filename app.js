@@ -1647,6 +1647,9 @@ async function exportRealtimeWebCodecs(fps) {
       sampleRate: audio.sampleRate,
       numberOfChannels: audio.channels,
     },
+    // iOS-inspelat ljud börjar inte exakt på 0 (t.ex. DTS=0.045s). "offset" gör
+    // att muxern normaliserar första tidsstämpeln per spår i stället för att kasta.
+    firstTimestampBehavior: "offset",
     fastStart: "in-memory",
   });
 
