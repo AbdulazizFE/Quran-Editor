@@ -1261,87 +1261,9 @@ async function pickAvcCodec(width, height, fps) {
 }
 
 async function webCodecsSupported() {
-  if (typeof VideoEncoder === "undefined" || typeof AudioEncoder === "undefined")
-    return false;
+  if (typeof VideoEncoder === "undefined") return false;
   const codec = await pickAvcCodec(canvas.width, canvas.height, 30);
   return !!codec;
-}
-
-// Rendera bakgrunden deterministiskt bild-för-bild och koda en LJUDLÖS MP4 med
-// WebCodecs (loopar utan frysning på iOS). Ljudet muxas in separat av anroparen.
-async function renderAndEncodeWebCodecs(fps) {
-  const width = canvas.width;
-  const height = canvas.height;
-
-  const codec = await pickAvcCodec(width, height, fps);
-  if (!codec) throw new Error("ingen H.264-profil stöds");
-
-  const { Muxer, ArrayBufferTarget } = await import(
-    "https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/+esm"
-  );
-
-  const muxer = new Muxer({
-    target: new ArrayBufferTarget(),
-    video: { codec: "avc", width, height },
-    fastStart: "in-memory",
-  });
-
-  let encodeError = null;
-  const videoEncoder = new VideoEncoder({
-    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-    error: (e) => (encodeError = e),
-  });
-  videoEncoder.configure({
-    codec,
-    width,
-    height,
-    bitrate: isMobile() ? 5_000_000 : 8_000_000,
-    framerate: fps,
-  });
-
-  const bgVideo = state.bg.type === "video" ? state.bg.el : null;
-  if (bgVideo) {
-    try {
-      bgVideo.pause();
-    } catch (e) {}
-  }
-
-  const dur = state.audioDuration;
-  const totalFrames = Math.max(1, Math.round(dur * fps));
-  const frameDur = Math.round(1e6 / fps);
-
-  // Rendera + koda varje ruta (0..92 %)
-  for (let i = 0; i < totalFrames; i++) {
-    if (encodeError) throw encodeError;
-    const t = i / fps;
-    if (bgVideo && bgVideo.duration && isFinite(bgVideo.duration)) {
-      const vt = state.loopBg
-        ? t % bgVideo.duration
-        : Math.min(t, bgVideo.duration - 0.05);
-      await seekVideo(bgVideo, vt);
-    }
-    drawCompositeAt(t);
-    const frame = new VideoFrame(canvas, {
-      timestamp: Math.round(t * 1e6),
-      duration: frameDur,
-    });
-    videoEncoder.encode(frame, { keyFrame: i % (fps * 2) === 0 });
-    frame.close();
-    // Backpressure – låt kodaren hinna med
-    if (videoEncoder.encodeQueueSize > 8) {
-      await new Promise((r) => setTimeout(r, 0));
-    }
-    setProgress((i / totalFrames) * 92);
-    setStatus(`جارٍ رسم الإطارات… ${Math.round((i / totalFrames) * 100)}%`, "");
-  }
-  await videoEncoder.flush();
-  videoEncoder.close();
-  if (encodeError) throw encodeError;
-
-  // Muxa till en ljudlös MP4 (ljudet läggs på av anroparen)
-  setProgress(96);
-  muxer.finalize();
-  return new Blob([muxer.target.buffer], { type: "video/mp4" });
 }
 
 // Reserv: rendera rutor och koda med ffmpeg.wasm (JPEG-sekvens + WAV → MP4).
@@ -1419,33 +1341,6 @@ async function renderAndEncodeFfmpeg(fps) {
   return new Blob([data.buffer], { type: "video/mp4" });
 }
 
-// Lägg på ljud på en färdig (ljudlös) video med ffmpeg: kopiera videon utan
-// omkodning och koda bara det korta ljudet till AAC. Mycket lätt (funkar på iOS).
-async function muxWithAudio(videoBlob) {
-  setStatus("جارٍ إضافة الصوت… ⏳", "");
-  ffmpegProgress = (p) => setProgress(90 + p * 10);
-  const ff = await withTimeout(ensureFfmpeg(), 90000, "تعذّر تحميل مكوّن الصوت");
-  await ff.writeFile("v.mp4", new Uint8Array(await videoBlob.arrayBuffer()));
-  await ff.writeFile("a.wav", audioBufferToWav(state.combinedBuffer));
-  await ff.exec([
-    "-i", "v.mp4",
-    "-i", "a.wav",
-    "-c:v", "copy",
-    "-c:a", "aac",
-    "-b:a", "192k",
-    "-shortest",
-    "-movflags", "+faststart",
-    "out.mp4",
-  ]);
-  const data = await ff.readFile("out.mp4");
-  try {
-    await ff.deleteFile("v.mp4");
-    await ff.deleteFile("a.wav");
-    await ff.deleteFile("out.mp4");
-  } catch (e) {}
-  return new Blob([data.buffer], { type: "video/mp4" });
-}
-
 // Bygg AudioSpecificConfig-bytes för AAC-LC (mp4a.40.2) utifrån frekvens/kanaler.
 // Krävs av mp4-muxer för att skriva en giltig esds-atom kring de färdiga AAC-ramarna.
 function makeAacAsc(sampleRate, channels) {
@@ -1460,76 +1355,6 @@ function makeAacAsc(sampleRate, channels) {
   const b0 = (objType << 3) | (idx >> 1);
   const b1 = ((idx & 1) << 7) | (ch << 3);
   return new Uint8Array([b0, b1]);
-}
-
-// Spela recitationen i realtid genom en MediaStreamAudioDestinationNode och spela
-// in den med MediaRecorder. På iOS är detta den ENDA metoden som garanterat ger
-// hörbart ljud (WebCodecs AAC-kodaren kan bli tyst där). Returnerar { blob, mime }.
-function recordAudioTrack(onProgress) {
-  return new Promise((resolve, reject) => {
-    const acx = getAudioCtx();
-    if (acx.state === "suspended") acx.resume();
-    const dest = acx.createMediaStreamDestination();
-    const src = acx.createBufferSource();
-    src.buffer = state.combinedBuffer;
-    src.connect(dest);
-
-    const cands = [
-      "audio/mp4;codecs=mp4a.40.2",
-      "audio/mp4",
-      "audio/webm;codecs=opus",
-      "audio/webm",
-    ];
-    let mime = "";
-    for (const m of cands) {
-      if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) {
-        mime = m;
-        break;
-      }
-    }
-
-    let rec;
-    try {
-      rec = new MediaRecorder(dest.stream, mime ? { mimeType: mime } : undefined);
-    } catch (e) {
-      return reject(e);
-    }
-
-    const chunks = [];
-    const totalDur = state.audioDuration || state.combinedBuffer.duration || 1;
-    const startT = acx.currentTime;
-    const ticker = setInterval(() => {
-      if (onProgress) {
-        onProgress(Math.min(1, (acx.currentTime - startT) / totalDur));
-      }
-    }, 100);
-
-    rec.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunks.push(e.data);
-    };
-    rec.onerror = (e) => {
-      clearInterval(ticker);
-      reject((e && e.error) || new Error("فشل تسجيل الصوت"));
-    };
-    rec.onstop = () => {
-      clearInterval(ticker);
-      if (onProgress) onProgress(1);
-      resolve({ blob: new Blob(chunks, { type: mime || "audio/mp4" }), mime });
-    };
-    src.onended = () => {
-      try {
-        rec.stop();
-      } catch (e) {}
-    };
-
-    try {
-      rec.start();
-      src.start();
-    } catch (e) {
-      clearInterval(ticker);
-      reject(e);
-    }
-  });
 }
 
 // Extrahera färdigkodade AAC-ramar ur en (ev. fragmenterad) MP4-inspelning med
@@ -1597,27 +1422,172 @@ async function demuxAudio(blob, mime) {
   return meta;
 }
 
-// Bygg en färdig MP4 med loopande bakgrundsvideo + ljud, utan frysning och utan
-// ffmpeg: WebCodecs renderar videon deterministiskt (ingen frysning på iOS) och
-// ljudet spelas in med MediaRecorder (garanterat hörbart på iOS), demuxas till
-// AAC-ramar med mp4box och muxas ihop med videon via mp4-muxer.
-async function buildVideoWithRecordedAudio(fps) {
-  // 1) Spela in ljudet i realtid (hörbart på iOS).
-  setStatus("جارٍ تسجيل الصوت… ⏳", "");
-  setProgress(0);
-  const { blob: audioBlob, mime } = await recordAudioTrack((p) =>
-    setProgress(p * 30)
-  );
-
-  // 2) Demuxa AAC-ramarna ur inspelningen.
-  setStatus("جارٍ تجهيز الصوت… ⏳", "");
-  const audio = await demuxAudio(audioBlob, mime);
-
-  // 3) Sätt upp muxern med både video- och ljudspår.
+// Snabb export med bakgrundsvideo – i realtid, utan frysning och utan ffmpeg.
+// - VIDEON kodas med WebCodecs genom att ta ögonblicksbilder av canvasen varje
+//   ruta. Till skillnad från canvas.captureStream (som fryser på iOS när
+//   bakgrundsvideon loopar) fryser WebCodecs-fångst ALDRIG, och det finns ingen
+//   långsam bild-för-bild-sökning → exporten tar ungefär lika lång tid som klippet.
+// - LJUDET spelas in parallellt med MediaRecorder över en kombinerad ström
+//   (video + ljud). Det är den enda metoden som garanterat ger hörbart ljud på
+//   iOS. Endast ljudspåret demuxas ut och muxas ihop med WebCodecs-videon.
+async function exportRealtimeWebCodecs(fps) {
+  const acx = getAudioCtx();
+  if (acx.state === "suspended") await acx.resume();
   const width = canvas.width;
   const height = canvas.height;
-  const codec = await pickAvcCodec(width, height, fps);
-  if (!codec) throw new Error("ingen H.264-profil stöds");
+  const totalDur = state.audioDuration;
+
+  const vcodec = await pickAvcCodec(width, height, fps);
+  if (!vcodec) throw new Error("ingen H.264-profil stöds");
+
+  // --- Ljudinspelning: kombinerad ström så iOS faktiskt tar med ljudet ---
+  const carrier = canvas.captureStream(fps); // bärvågsvideo, kasseras (endast ljudet används)
+  const recStream = new MediaStream([
+    ...carrier.getVideoTracks(),
+    ...audioDest.stream.getAudioTracks(),
+  ]);
+  const recMime = pickMimeType();
+  let audioRec;
+  try {
+    audioRec = new MediaRecorder(
+      recStream,
+      recMime ? { mimeType: recMime } : undefined
+    );
+  } catch (e) {
+    throw new Error("ljudinspelning stöds inte");
+  }
+  const recChunks = [];
+  audioRec.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) recChunks.push(e.data);
+  };
+  const audioBlobReady = new Promise((resolve, reject) => {
+    audioRec.onstop = () =>
+      resolve(new Blob(recChunks, { type: recMime || "video/mp4" }));
+    audioRec.onerror = (e) =>
+      reject((e && e.error) || new Error("ljudinspelning misslyckades"));
+  });
+
+  // --- WebCodecs-videokodare: chunks buffras och muxas efter demux av ljudet ---
+  const frameDur = Math.round(1e6 / fps);
+  const videoChunks = [];
+  let videoDecoderConfig = null;
+  let encodeError = null;
+  const videoEncoder = new VideoEncoder({
+    output: (chunk, meta) => {
+      if (meta && meta.decoderConfig && !videoDecoderConfig)
+        videoDecoderConfig = meta.decoderConfig;
+      const data = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(data);
+      videoChunks.push({
+        data,
+        type: chunk.type,
+        timestamp: chunk.timestamp,
+        duration: chunk.duration || frameDur,
+      });
+    },
+    error: (e) => (encodeError = e),
+  });
+  videoEncoder.configure({
+    codec: vcodec,
+    width,
+    height,
+    bitrate: isMobile() ? 5_000_000 : 8_000_000,
+    framerate: fps,
+  });
+
+  // --- Starta ljud + spela bakgrundsvideon (loop via uppspelning, ingen sökning) ---
+  const bgVideo = state.bg.type === "video" ? state.bg.el : null;
+  const src = acx.createBufferSource();
+  src.buffer = state.combinedBuffer;
+  src.connect(audioDest);
+
+  if (bgVideo) {
+    try {
+      bgVideo.loop = true;
+      bgVideo.currentTime = 0;
+      const p = bgVideo.play();
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+  }
+
+  const gopSize = Math.max(1, Math.round(fps * 2));
+  let frameIndex = 0;
+  let finished = false;
+  let timer = null;
+  const startT = acx.currentTime;
+
+  audioRec.start();
+  src.start();
+
+  await new Promise((resolve) => {
+    src.onended = resolve;
+    timer = setInterval(() => {
+      if (finished) return;
+      const elapsed = acx.currentTime - startT;
+      if (encodeError || elapsed >= totalDur) {
+        resolve();
+        return;
+      }
+      // Håll bakgrundsvideon rullande och loopande (drivs av uppspelning).
+      if (bgVideo) {
+        if (
+          bgVideo.ended ||
+          (bgVideo.duration &&
+            isFinite(bgVideo.duration) &&
+            bgVideo.currentTime >= bgVideo.duration - 0.05)
+        ) {
+          if (state.loopBg) {
+            try {
+              bgVideo.currentTime = 0;
+            } catch (e) {}
+          }
+        }
+        if (bgVideo.paused && bgVideo.readyState >= 2) {
+          const p = bgVideo.play();
+          if (p && p.catch) p.catch(() => {});
+        }
+      }
+      drawCompositeAt(elapsed);
+      const frame = new VideoFrame(canvas, {
+        timestamp: Math.round(elapsed * 1e6),
+        duration: frameDur,
+      });
+      try {
+        videoEncoder.encode(frame, { keyFrame: frameIndex % gopSize === 0 });
+      } catch (e) {
+        encodeError = e;
+      }
+      frame.close();
+      frameIndex++;
+      setProgress(Math.min(80, (elapsed / totalDur) * 80));
+      setStatus(`جارٍ الإنشاء… ${Math.round((elapsed / totalDur) * 100)}%`, "");
+    }, 1000 / fps);
+  });
+
+  finished = true;
+  if (timer) clearInterval(timer);
+  try {
+    src.stop();
+  } catch (e) {}
+  try {
+    audioRec.stop();
+  } catch (e) {}
+  if (bgVideo) {
+    try {
+      bgVideo.pause();
+    } catch (e) {}
+  }
+
+  await videoEncoder.flush();
+  videoEncoder.close();
+  if (encodeError) throw encodeError;
+  if (!videoChunks.length) throw new Error("ingen videokodning");
+
+  // --- Demuxa ljudet och muxa ihop med videon (ingen omkodning, inget ffmpeg) ---
+  setProgress(85);
+  setStatus("جارٍ دمج الصوت… ⏳", "");
+  const audioBlob = await audioBlobReady;
+  const audio = await demuxAudio(audioBlob, recMime || audioBlob.type);
 
   const { Muxer, ArrayBufferTarget } = await import(
     "https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/+esm"
@@ -1633,63 +1603,23 @@ async function buildVideoWithRecordedAudio(fps) {
     fastStart: "in-memory",
   });
 
-  // 4) Rendera videon deterministiskt (loopar, fryser aldrig).
-  let encodeError = null;
-  const videoEncoder = new VideoEncoder({
-    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-    error: (e) => (encodeError = e),
-  });
-  videoEncoder.configure({
-    codec,
-    width,
-    height,
-    bitrate: isMobile() ? 5_000_000 : 8_000_000,
-    framerate: fps,
-  });
-
-  const bgVideo = state.bg.type === "video" ? state.bg.el : null;
-  if (bgVideo) {
-    try {
-      bgVideo.pause();
-    } catch (e) {}
+  for (let i = 0; i < videoChunks.length; i++) {
+    const c = videoChunks[i];
+    muxer.addVideoChunkRaw(
+      c.data,
+      c.type,
+      c.timestamp,
+      c.duration,
+      i === 0 ? { decoderConfig: videoDecoderConfig } : undefined
+    );
   }
-
-  const dur = state.audioDuration;
-  const totalFrames = Math.max(1, Math.round(dur * fps));
-  const frameDur = Math.round(1e6 / fps);
-
-  for (let i = 0; i < totalFrames; i++) {
-    if (encodeError) throw encodeError;
-    const t = i / fps;
-    if (bgVideo && bgVideo.duration && isFinite(bgVideo.duration)) {
-      const vt = state.loopBg
-        ? t % bgVideo.duration
-        : Math.min(t, bgVideo.duration - 0.05);
-      await seekVideo(bgVideo, vt);
-    }
-    drawCompositeAt(t);
-    const frame = new VideoFrame(canvas, {
-      timestamp: Math.round(t * 1e6),
-      duration: frameDur,
-    });
-    videoEncoder.encode(frame, { keyFrame: i % (fps * 2) === 0 });
-    frame.close();
-    if (videoEncoder.encodeQueueSize > 8) {
-      await new Promise((r) => setTimeout(r, 0));
-    }
-    setProgress(30 + (i / totalFrames) * 62);
-    setStatus(`جارٍ رسم الإطارات… ${Math.round((i / totalFrames) * 100)}%`, "");
-  }
-  await videoEncoder.flush();
-  videoEncoder.close();
-  if (encodeError) throw encodeError;
-
-  // 5) Muxa in de färdiga AAC-ramarna (ingen omkodning).
-  setProgress(94);
-  setStatus("جارٍ دمج الصوت… ⏳", "");
   for (let i = 0; i < audio.chunks.length; i++) {
     const c = audio.chunks[i];
-    const meta =
+    muxer.addAudioChunkRaw(
+      c.data,
+      c.type,
+      c.timestamp,
+      c.duration,
       i === 0
         ? {
             decoderConfig: {
@@ -1699,8 +1629,8 @@ async function buildVideoWithRecordedAudio(fps) {
               description: audio.description,
             },
           }
-        : undefined;
-    muxer.addAudioChunkRaw(c.data, c.type, c.timestamp, c.duration, meta);
+        : undefined
+    );
   }
 
   setProgress(98);
@@ -1708,29 +1638,9 @@ async function buildVideoWithRecordedAudio(fps) {
   return new Blob([muxer.target.buffer], { type: "video/mp4" });
 }
 
-// Bygg en färdig MP4 med loopande bakgrundsvideo + ljud, utan frysning.
-// Föredragen väg (mobil-säker, utan ffmpeg): WebCodecs-video + inspelat ljud
-// (MediaRecorder) demuxat med mp4box. Reservvägar: WebCodecs-video + ffmpeg-mux,
-// sedan full ffmpeg. Anroparen faller till slut tillbaka till realtidsinspelning.
-async function buildVideoWithAudio(fps) {
-  if (await webCodecsSupported()) {
-    // 1) Bästa vägen: inget ffmpeg alls.
-    try {
-      return await buildVideoWithRecordedAudio(fps);
-    } catch (e) {
-      // fortsätt till ffmpeg-baserad reserv
-    }
-    // 2) Reserv: WebCodecs-video (ljudlös) + ffmpeg lägger på ljudet.
-    try {
-      const videoBlob = await renderAndEncodeWebCodecs(fps);
-      return await muxWithAudio(videoBlob);
-    } catch (e2) {}
-  }
-  // 3) Sista reserv: hela jobbet via ffmpeg.
-  return await renderAndEncodeFfmpeg(fps);
-}
-
-// Export med bakgrundsvideo: deterministisk bild-för-bild-rendering.
+// Export med bakgrundsvideo: snabb realtidsrendering med WebCodecs (ingen frysning,
+// perfekt loop) + inspelat ljud. Faller tillbaka till ffmpeg (äldre webbläsare
+// utan WebCodecs) och till sist till vanlig realtidsinspelning.
 async function exportWithBackgroundVideo() {
   if (!state.combinedBuffer) return;
   exporting = true;
@@ -1747,12 +1657,14 @@ async function exportWithBackgroundVideo() {
   showProgress("جارٍ إنشاء الفيديو…");
   setProgress(0);
   setStatus(
-    "جارٍ إنشاء الفيديو إطارًا بإطار (خلفية متكررة + صوت)… قد يستغرق قليلًا ⏳",
+    "جارٍ إنشاء الفيديو (خلفية متكررة بلا تجميد + صوت)… ⏳",
     ""
   );
 
   try {
-    const blob = await buildVideoWithAudio(fps);
+    const blob = (await webCodecsSupported())
+      ? await exportRealtimeWebCodecs(fps)
+      : await renderAndEncodeFfmpeg(fps);
     hideProgress();
     recordBtn.classList.remove("recording");
     playBtn.disabled = false;
