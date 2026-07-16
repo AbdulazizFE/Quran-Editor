@@ -819,7 +819,9 @@ function pickMimeType() {
 // frysning) och ljudet läggs på med ffmpeg. Annat (gradient/bild) → realtid.
 function startRecording() {
   if (!state.combinedBuffer) return;
-  if (state.bg.type === "video" && state.bg.el) {
+  // iOS har ofta stabilare resultat med realtidsinspelning för canvas + ljud,
+  // särskilt när bakgrundsvideon används.
+  if (state.bg.type === "video" && state.bg.el && !isIOS()) {
     exportWithBackgroundVideo();
   } else {
     startRealtimeRecording();
@@ -962,7 +964,32 @@ async function exportRecording(mimeType, isMp4) {
   // ändå försöka konvertera till MP4, annars fungerar den ofta inte i Safari.
   if (isMobile()) {
     dbg("mobile export: isMp4=" + isMp4 + " mimeType=" + mimeType + " blob.type=" + blob.type);
-    if (!isMp4) {
+    const ext = isMp4 ? "mp4" : "webm";
+    if (isMp4) {
+      setStatus(
+        "جارٍ تحسين MP4 للهواتف المحمولة… ⏳",
+        ""
+      );
+      try {
+        const mp4Blob = await withTimeout(
+          convertToMp4(blob, inputName, { remux: true }),
+          120000,
+          "انتهت المهلة"
+        );
+        await offerDownload(mp4Blob, `${base}.mp4`);
+        setStatus(
+          "تم! اضغط على الزر لحفظ الفيديو أو مشاركته. ✅",
+          "ok"
+        );
+        return;
+      } catch (err) {
+        dbg("mobile MP4 remux failed: " + (err && err.message));
+        setStatus(
+          "تم إنشاء الفيديو، لكن لم تمكّن عملية التحويل التلقائي. سيتم تنزيل النسخة الأصلية.",
+          ""
+        );
+      }
+    } else {
       setStatus(
         "جارٍ تحويل الفيديو إلى MP4 للهواتف المحمولة… ⏳",
         ""
@@ -988,7 +1015,6 @@ async function exportRecording(mimeType, isMp4) {
       }
     }
 
-    const ext = isMp4 ? "mp4" : "webm";
     await offerDownload(blob, `${base}.${ext}`);
     setStatus(
       "تم! اضغط على الزر لحفظ الفيديو أو مشاركته. ✅",
