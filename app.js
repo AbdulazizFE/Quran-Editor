@@ -102,6 +102,7 @@ let recorder = null;
 let recordedChunks = [];
 let recordVideoTrack = null; // CanvasCaptureMediaStreamTrack (manuell frame-push)
 let recordTimer = null; // jämn render-/fångst-timer under inspelning
+let frameTick = 0; // räknare för "anti-freeze"-pixeln under inspelning
 let exportReady = null; // { url, filename, file, canShare } efter en export
 
 function getAudioCtx() {
@@ -451,16 +452,26 @@ function renderFrame() {
   const cw = canvas.width,
     ch = canvas.height;
 
-  // Håll bakgrundsvideon igång under uppspelning/inspelning. iOS pausar den
-  // ibland när den ritas till en canvas som fångas – återuppta då automatiskt.
+  // Håll bakgrundsvideon igång och looprad under uppspelning/inspelning.
+  // På iOS är 'loop'-attributet och 'ended'-eventet opålitliga när videon ritas
+  // till en canvas som spelas in – därför loopar vi proaktivt via currentTime.
   if (state.bg.type === "video" && state.bg.el) {
     const v = state.bg.el;
-    if (
-      (state.recording || (previewSource && !state.paused)) &&
-      v.paused &&
-      v.readyState >= 2
-    ) {
-      v.play().catch(() => {});
+    const active = state.recording || (previewSource && !state.paused);
+    if (active && v.readyState >= 2) {
+      if (
+        state.loopBg &&
+        v.duration &&
+        isFinite(v.duration) &&
+        v.currentTime >= v.duration - 0.08
+      ) {
+        // Spola tillbaka strax före slutet så videon aldrig stannar på en
+        // frusen sista bild (vilket fryser hela inspelningen på iOS).
+        try {
+          v.currentTime = 0;
+        } catch (e) {}
+      }
+      if (v.paused) v.play().catch(() => {});
     }
   }
 
@@ -511,6 +522,15 @@ function renderFrame() {
 
   if (state.segments.length) drawVerse(computeTextAnim(segElapsed));
   drawWatermark();
+
+  // Anti-freeze: rita en nästan osynlig 2×2-pixel som ändras varje ruta. Det
+  // håller canvasen "smutsig" så mobil auto-sampling (iOS) aldrig tror att
+  // bilden är oförändrad och slutar fånga rutor när bakgrundsvideon tar slut.
+  if (state.recording) {
+    frameTick = (frameTick + 1) % 256;
+    ctx.fillStyle = `rgb(${frameTick},${(frameTick * 7) % 256},${(frameTick * 13) % 256})`;
+    ctx.fillRect(0, 0, 2, 2);
+  }
 }
 
 // Beräkna text-animeringens tillstånd (opacitet, förskjutning, skala, oskärpa)
@@ -733,17 +753,25 @@ function startRecording() {
   const mimeType = pickMimeType();
   const isMp4 = mimeType.startsWith("video/mp4");
 
-  // Använd manuell frame-styrning (captureStream(0) + requestFrame) så bildflödet
-  // blir helt oberoende av requestAnimationFrame, som mobila webbläsare stryper
-  // under inspelning. Faller tillbaka till auto-sampling om det inte stöds.
-  let videoStream = canvas.captureStream(0);
-  let vTrack = videoStream.getVideoTracks()[0];
-  if (!vTrack || typeof vTrack.requestFrame !== "function") {
+  // Använd manuell frame-styrning (captureStream(0) + requestFrame) på dator –
+  // det är exakt och pålitligt. På mobil (särskilt iOS) är manuell frame-push
+  // opålitlig; där används auto-sampling (30 fps) tillsammans med "anti-freeze"-
+  // pixeln och den sömlösa videoloopen som håller bildflödet igång.
+  let videoStream, vTrack;
+  if (isMobile()) {
     videoStream = canvas.captureStream(30);
     vTrack = videoStream.getVideoTracks()[0];
     recordVideoTrack = null;
   } else {
-    recordVideoTrack = vTrack;
+    videoStream = canvas.captureStream(0);
+    vTrack = videoStream.getVideoTracks()[0];
+    if (!vTrack || typeof vTrack.requestFrame !== "function") {
+      videoStream = canvas.captureStream(30);
+      vTrack = videoStream.getVideoTracks()[0];
+      recordVideoTrack = null;
+    } else {
+      recordVideoTrack = vTrack;
+    }
   }
   const combined = new MediaStream([
     ...videoStream.getVideoTracks(),
