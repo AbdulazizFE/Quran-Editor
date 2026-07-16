@@ -470,11 +470,27 @@ function renderLoop() {
 }
 
 function renderFrame() {
-  // Håll bakgrundsvideon igång och looprad under uppspelning/inspelning (live).
+  // Bakgrundsvideo: under inspelning styrs positionen deterministiskt från
+  // ljudklockan (tid % längd) så videon aldrig "tar slut" och fryser fångsten
+  // på iOS. Under förhandsvisning spelas den mjukt med loop.
   if (state.bg.type === "video" && state.bg.el) {
     const v = state.bg.el;
-    const active = state.recording || (previewSource && !state.paused);
-    if (active) {
+    if (
+      state.recording &&
+      state.playStartTime !== null &&
+      v.duration &&
+      isFinite(v.duration) &&
+      v.duration > 0
+    ) {
+      const el = audioCtx.currentTime - state.playStartTime;
+      const vt = state.loopBg
+        ? el % v.duration
+        : Math.min(el, v.duration - 0.05);
+      try {
+        if (!v.paused) v.pause();
+        v.currentTime = vt;
+      } catch (e) {}
+    } else if (previewSource && !state.paused) {
       const dur = v.duration;
       if (
         state.loopBg &&
@@ -768,15 +784,12 @@ function pickMimeType() {
   return "";
 }
 
-// Väljer exportmetod: deterministisk bild-för-bild när bakgrunden är en video
-// (garanterar loop utan frysning), annars vanlig realtidsinspelning.
+// Exportmetod: realtidsinspelning (MediaRecorder) för allt – den fångar ljudet
+// pålitligt (även på iOS). Bakgrundsvideon loopas deterministiskt i renderFrame
+// så den aldrig fryser. (WebCodecs-vägen gav tyst ljud på iOS.)
 function startRecording() {
   if (!state.combinedBuffer) return;
-  if (state.bg.type === "video" && state.bg.el) {
-    exportWithBackgroundVideo();
-  } else {
-    startRealtimeRecording();
-  }
+  startRealtimeRecording();
 }
 
 function startRealtimeRecording() {
