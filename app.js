@@ -320,15 +320,33 @@ function concatBuffers(acx, buffers) {
 }
 
 // ---- Bakgrund ----
+function removeBgVideoEl() {
+  if (state.bg.type === "video" && state.bg.el && state.bg.el.parentNode) {
+    state.bg.el.parentNode.removeChild(state.bg.el);
+  }
+}
+
 function handleBgFile(file) {
   if (!file) return;
+  removeBgVideoEl();
   const url = URL.createObjectURL(file);
   if (file.type.startsWith("video/")) {
     const v = document.createElement("video");
     v.src = url;
     v.muted = true;
+    v.defaultMuted = true;
     v.loop = state.loopBg;
     v.playsInline = true;
+    // iOS-attribut (måste sättas även som HTML-attribut, inte bara properties)
+    v.setAttribute("muted", "");
+    v.setAttribute("playsinline", "");
+    v.setAttribute("webkit-playsinline", "");
+    v.preload = "auto";
+    // iOS kräver att videon finns i DOM:en (och inte är display:none) för att
+    // spela och gå att rita till en <canvas>. Lägg den utanför skärmen.
+    v.style.cssText =
+      "position:fixed;left:-9999px;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none;";
+    document.body.appendChild(v);
     // Manuell loop som reserv: på iOS avfyras inte alltid loop-attributet när
     // videon ritas till en canvas som spelas in. Spola då tillbaka och spela igen.
     v.addEventListener("ended", () => {
@@ -339,6 +357,7 @@ function handleBgFile(file) {
         } catch (e) {}
       }
     });
+    v.load();
     // Vänta med att spela – videon startas automatiskt när uppspelning/inspelning
     // börjar och pausas när versen är klar.
     v.pause();
@@ -381,6 +400,7 @@ function resumeBgVideo() {
 
 function clearBg() {
   stopBgVideo();
+  removeBgVideoEl();
   state.bg = { type: "gradient", el: null };
   bgFile.value = "";
 }
@@ -454,24 +474,31 @@ function renderFrame() {
 
   // Håll bakgrundsvideon igång och looprad under uppspelning/inspelning.
   // På iOS är 'loop'-attributet och 'ended'-eventet opålitliga när videon ritas
-  // till en canvas som spelas in – därför loopar vi proaktivt via currentTime.
+  // till en canvas som spelas in, och när videon tar slut fryser hela fångsten
+  // (videons bildrutor driver canvas-inspelningen). Därför loopar vi proaktivt.
   if (state.bg.type === "video" && state.bg.el) {
     const v = state.bg.el;
     const active = state.recording || (previewSource && !state.paused);
-    if (active && v.readyState >= 2) {
+    if (active) {
+      const dur = v.duration;
       if (
         state.loopBg &&
-        v.duration &&
-        isFinite(v.duration) &&
-        v.currentTime >= v.duration - 0.08
+        dur &&
+        isFinite(dur) &&
+        dur > 0 &&
+        (v.ended || v.currentTime >= dur - 0.15)
       ) {
         // Spola tillbaka strax före slutet så videon aldrig stannar på en
-        // frusen sista bild (vilket fryser hela inspelningen på iOS).
+        // frusen sista bild (vilket annars fryser hela inspelningen på iOS).
         try {
           v.currentTime = 0;
         } catch (e) {}
       }
-      if (v.paused) v.play().catch(() => {});
+      // Se till att videon alltid spelar under inspelning/uppspelning.
+      if (v.paused && v.readyState >= 1) {
+        const p = v.play();
+        if (p && p.catch) p.catch(() => {});
+      }
     }
   }
 
